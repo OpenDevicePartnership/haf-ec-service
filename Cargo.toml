@@ -10,7 +10,7 @@ categories = [ "embedded", "no-std" ]
 version = "0.1.0"
 edition = "2021"
 keywords = [ "embedded", "no-std", "boot", "firmware" ]
-repository = "https://github.com/pop-project/haf_ec_service"
+repository = "https://github.com/OpenDevicePartnership/haf_ec_service"
 rust-version = "1.81"
 
 [workspace.dependencies]
@@ -18,7 +18,7 @@ aarch64-cpu = "9.4.0"
 ffa = "0.1"
 
 [patch.crates-io]
-ffa = { git = "https://github.com/pop-project/ffa" }
+ffa = { git = "https://github.com/OpenDevicePartnership/ffa" }
 
 # cargo build/run
 [profile.dev]
