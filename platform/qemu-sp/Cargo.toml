@@ -24,3 +24,4 @@ ec-service-lib.workspace = true
 aarch64-rt = { workspace = true, optional = true }
 aarch64-paging = { workspace = true, optional = true }
 aarch64-cpu = { workspace = true, optional = true }
+log.workspace = true

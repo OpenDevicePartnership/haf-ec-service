@@ -15,6 +15,7 @@ targets = ["aarch64-unknown-none", "aarch64-unknown-none-softfloat"]
 [dependencies]
 uuid.workspace = true
 ffa.workspace = true
+log.workspace = true
 
 [target.'cfg(target_os = "none")'.dependencies]
 aarch64-cpu.workspace = true

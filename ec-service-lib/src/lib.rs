@@ -1,19 +1,17 @@
 #![cfg_attr(target_os = "none", no_std)]
 #![cfg_attr(target_os = "none", no_main)]
 
-#[macro_use]
-extern crate ffa;
-
 mod service;
 pub mod services;
+pub mod sp_logger;
 
 use core::cell::RefCell;
 use ffa::msg::FfaMsg;
 use ffa::rxtx::FfaRxTxMsg;
 use ffa::{Ffa, FfaError};
-pub use service::Service;
-use service::{Result, ServiceImpl};
-use uuid::uuid;
+use log::{debug, error, info};
+use service::ServiceImpl;
+pub use service::{Result, Service};
 
 // For reference, here are the UUIDs for services that ec-service-lib defines (not all of them are implemented)
 // const UUID_EC_SVC_NOTIFY: Uuid = uuid!("B510B3A3-59F6-4054-BA7A-FF2EB1EAC765");
@@ -34,20 +32,23 @@ pub enum HafEcError {
 
 #[derive(Default)]
 pub struct HafEcService<'svc> {
-    pub tx_buffer_base: u64,
-    pub rx_buffer_base: u64,
-    pub rxtx_page_count: u32,
-    pub services: &'svc [RefCell<&'svc mut dyn Service>],
+    tx_buffer_base: u64,
+    rx_buffer_base: u64,
+    rxtx_page_count: u32,
+    services: &'svc [RefCell<&'svc mut dyn Service>],
 }
 
-impl HafEcService<'_> {
-    pub fn new() -> Self {
-        Self::default()
+impl<'svc> HafEcService<'svc> {
+    pub fn new(services: &'svc [RefCell<&'svc mut dyn Service>]) -> Self {
+        Self {
+            services,
+            ..Default::default()
+        }
     }
 
     pub fn map_rxtx_buffers(&mut self, tx_base: u64, rx_base: u64, page_count: u32) -> HafEcError {
         // Map in shared RX/TX buffers
-        println!(
+        debug!(
             "Mapping shared RX/TX buffers:
                TX_BUFFER_BASE: 0x{:x}
                RX_BUFFER_BASE: 0x{:x}
@@ -59,7 +60,7 @@ impl HafEcService<'_> {
         let result = rxtx.map(tx_base, rx_base, page_count);
         match result {
             FfaError::Ok => {
-                println!("Successfully mapped RXTX buffers");
+                debug!("Successfully mapped RXTX buffers");
                 self.tx_buffer_base = tx_base;
                 self.rx_buffer_base = rx_base;
                 self.rxtx_page_count = page_count;
@@ -67,7 +68,7 @@ impl HafEcService<'_> {
 
             _ => {
                 // This is fatal, terminate SP
-                println!("Error mapping RXTX buffers");
+                debug!("Error mapping RXTX buffers");
                 return HafEcError::InvalidParameters;
             }
         }
@@ -75,7 +76,7 @@ impl HafEcService<'_> {
     }
 
     fn ffa_msg_handler(&self, msg: &FfaMsg) -> Result<FfaMsg> {
-        println!(
+        debug!(
             r#"Successfully received ffa msg:
             function_id = {:08x}
                    uuid = {}"#,
@@ -89,26 +90,26 @@ impl HafEcService<'_> {
             }
         }
 
-        println!("Unknown UUID {}", msg.uuid);
+        error!("Unknown UUID {}", msg.uuid);
         Err(FfaError::InvalidParameters)
     }
 
-    pub fn sp_main(&self) -> ! {
-        println!("Entered sp_main");
+    pub fn sp_main(self) -> ! {
+        info!("Entered sp_main");
 
         // Get current FFA version
         let ffa = Ffa::new();
 
         // Call the msg_wait method
         match ffa.version() {
-            Ok(ver) => println!("FFA Version: {}.{}", ver.major(), ver.minor()),
+            Ok(ver) => info!("FFA Version: {}.{}", ver.major(), ver.minor()),
             Err(_e) => {
                 // This is fatal, terminate SP
-                println!("FFA Version failed")
+                error!("FFA Version failed")
             }
         }
 
-        println!("Entering FFA message loop");
+        debug!("Entering FFA message loop");
         // Call the msg_wait method
         let mut next_msg = ffa.msg_wait();
 
@@ -116,10 +117,10 @@ impl HafEcService<'_> {
             match next_msg {
                 Ok(ref ffamsg) => match self.ffa_msg_handler(ffamsg) {
                     Ok(msg) => next_msg = ffa.msg_resp(&msg),
-                    Err(e) => println!("Failed to handle FFA msg: {:?}", e),
+                    Err(e) => error!("Failed to handle FFA msg: {:?}", e),
                 },
                 Err(e) => {
-                    println!("Error executing msg_wait: {:?}", e);
+                    error!("Error executing msg_wait: {:?}", e);
                     next_msg = ffa.msg_wait();
                 }
             }

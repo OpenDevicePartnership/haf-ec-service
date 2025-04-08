@@ -5,6 +5,7 @@ use ffa::msg::FfaMsg;
 #[cfg(debug_assertions)]
 use ffa::notify::FfaNotify;
 use ffa::{FfaError, FfaFunctionId};
+use log::{debug, error};
 use uuid::{uuid, Uuid};
 
 // Protocol CMD definitions for FwMgmt
@@ -118,7 +119,7 @@ impl FwMgmt {
     }
 
     fn process_indirect(&self, seq_num: u16, rx_buffer: u64, tx_buffer: u64) -> GenericRsp {
-        println!("Processing indirect message: 0x{:x}", seq_num);
+        debug!("Processing indirect message: 0x{:x}", seq_num);
         let msg = FfaIndirectMsg::new();
         let mut in_buf: [u8; 256] = [0; 256];
         let mut status;
@@ -128,7 +129,7 @@ impl FwMgmt {
         };
 
         if status == FfaError::Ok {
-            println!("Indirect Message: {:?}", in_buf);
+            error!("Indirect Message: {:?}", in_buf);
         }
 
         // Populate TX buffer with response and matching seq num
@@ -156,7 +157,7 @@ impl Service for FwMgmt {
 
     fn ffa_msg_send_direct_req2(&mut self, msg: &FfaMsg) -> Result<FfaMsg> {
         let cmd = msg.extract_u8_at_index(0);
-        println!("Received FwMgmt command 0x{:x}", cmd);
+        debug!("Received FwMgmt command 0x{:x}", cmd);
 
         // Create new generic rsp packet swap destination and source
         let mut rsp = FfaMsg {
@@ -194,7 +195,7 @@ impl Service for FwMgmt {
                 Ok(rsp)
             }
             _ => {
-                println!("Unknown FwMgmt Command: {}", cmd);
+                error!("Unknown FwMgmt Command: {}", cmd);
                 Err(FfaError::InvalidParameters)
             }
         }

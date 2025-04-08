@@ -1,10 +1,9 @@
+use crate::service::{Result, Service};
 use ffa::msg::FfaMsg;
 use ffa::yld::FfaYield;
 use ffa::{FfaError, FfaFunctionId};
-use uuid::{Builder, Uuid};
-
-use crate::service::{Result, Service};
-use crate::uuid;
+use log::{debug, error};
+use uuid::{uuid, Builder, Uuid};
 
 // Protocol CMD definitions for Thermal
 const EC_THM_GET_TMP: u8 = 0x1;
@@ -70,10 +69,10 @@ impl From<&FfaMsg> for ReadVarReq {
         let d1 = (msg.args64[0] >> 32) as u32;
         let d2 = msg.args64[1] as u16;
         let d3 = (msg.args64[1] >> 16) as u16;
-        let d4 = ((msg.args64[1] >> 32) | (msg.args64[2] & 0xffffffff) << 32).to_le_bytes();
+        let d4 = ((msg.args64[1] >> 32) | ((msg.args64[2] & 0xffffffff) << 32)).to_le_bytes();
         ReadVarReq {
             id: ((msg.args64[0] >> 8) & 0xff) as u8,
-            len: (msg.args64[0] >> 16 & 0xffff) as u16,
+            len: ((msg.args64[0] >> 16) & 0xffff) as u16,
             var_uuid: Builder::from_fields(d1, d2, d3, &d4).into_uuid(),
         }
     }
@@ -84,10 +83,10 @@ impl From<&FfaMsg> for SetVarReq {
         let d1 = (msg.args64[0] >> 32) as u32;
         let d2 = msg.args64[1] as u16;
         let d3 = (msg.args64[1] >> 16) as u16;
-        let d4 = ((msg.args64[1] >> 32) | (msg.args64[2] & 0xffffffff) << 32).to_le_bytes();
+        let d4 = ((msg.args64[1] >> 32) | ((msg.args64[2] & 0xffffffff) << 32)).to_le_bytes();
         SetVarReq {
             id: ((msg.args64[0] >> 8) & 0xff) as u8,
-            len: (msg.args64[0] >> 16 & 0xffff) as u16,
+            len: ((msg.args64[0] >> 16) & 0xffff) as u16,
             var_uuid: Builder::from_fields(d1, d2, d3, &d4).into_uuid(),
             data: (msg.args64[2] >> 32) as u32,
         }
@@ -103,15 +102,15 @@ impl Thermal {
     }
 
     fn get_temperature(&self, msg: &FfaMsg) -> TempRsp {
-        println!("get_temperature sensor 0x{:x}", msg.extract_u8_at_index(1));
+        debug!("get_temperature sensor 0x{:x}", msg.extract_u8_at_index(1));
 
         // Tell OS to delay 1 ms
         let yld = FfaYield::new(0x100000000);
         let result = yld.exec();
-        println!("Return from FfaYield1: {:?}", result);
+        debug!("Return from FfaYield1: {:?}", result);
 
         let result = yld.exec();
-        println!("Return from FfaYield2: {:?}", result);
+        debug!("Return from FfaYield2: {:?}", result);
 
         TempRsp {
             _status: 0x0,
@@ -121,7 +120,7 @@ impl Thermal {
 
     fn set_threshold(&self, msg: &FfaMsg) -> GenericRsp {
         let req: ThresholdReq = msg.into();
-        println!(
+        debug!(
             "set_threshold temperature sensor 0x{:x}
                 Timeout: 0x{:x}
                 LowThreshold: 0x{:x}
@@ -142,7 +141,7 @@ impl Thermal {
 
     fn get_variable(&self, msg: &FfaMsg) -> ReadVarRsp {
         let req: ReadVarReq = msg.into();
-        println!(
+        debug!(
             "get_variable instance id: 0x{:x}
                 length: 0x{:x}
                 uuid: {}",
@@ -151,7 +150,7 @@ impl Thermal {
 
         // Only support DWORD customized IO for now
         if req.len != 4 {
-            println!("get_variable only supports DWORD read")
+            error!("get_variable only supports DWORD read")
         }
 
         ReadVarRsp {
@@ -162,7 +161,7 @@ impl Thermal {
 
     fn set_variable(&self, msg: &FfaMsg) -> GenericRsp {
         let req: SetVarReq = msg.into();
-        println!(
+        debug!(
             "get_variable instance id: 0x{:x}
                 length: 0x{:x}
                 uuid: {}
@@ -187,7 +186,7 @@ impl Service for Thermal {
 
     fn ffa_msg_send_direct_req2(&mut self, msg: &FfaMsg) -> Result<FfaMsg> {
         let cmd = msg.extract_u8_at_index(0);
-        println!("Received Thermal command 0x{:x}", cmd);
+        debug!("Received ThmMgmt command 0x{:x}", cmd);
 
         // Create new generic rsp packet swap destination and source
         let mut rsp = FfaMsg {
@@ -224,7 +223,7 @@ impl Service for Thermal {
                 Ok(rsp)
             }
             _ => {
-                println!("Unknown Thermal Command: {}", cmd);
+                error!("Unknown Thermal Command: {}", cmd);
                 Err(FfaError::InvalidParameters)
             }
         }

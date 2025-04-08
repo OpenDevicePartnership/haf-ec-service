@@ -1,6 +1,7 @@
 use crate::{Result, Service};
 use ffa::msg::FfaMsg;
 use ffa::{FfaError, FfaFunctionId};
+use log::{debug, error};
 use uuid::{uuid, Uuid};
 
 // Protocol CMD definitions for Notification
@@ -46,12 +47,12 @@ impl Notify {
     }
 
     fn nfy_setup(&self, msg: &FfaMsg) -> NfyGenericRsp {
-        println!("cmd: {}", msg.args64[0]);
-        println!("uuid_lo: 0x{:x}", msg.args64[1]);
-        println!("uuid_hi: 0x{:x}", msg.args64[2]);
-        println!("Count: {}", msg.args64[3]);
-        println!("Mapping1: 0x{:x}", msg.args64[4]);
-        println!("Mapping2: 0x{:x}", msg.args64[5]);
+        debug!("cmd: {}", msg.args64[0]);
+        debug!("uuid_lo: 0x{:x}", msg.args64[1]);
+        debug!("uuid_hi: 0x{:x}", msg.args64[2]);
+        debug!("Count: {}", msg.args64[3]);
+        debug!("Mapping1: 0x{:x}", msg.args64[4]);
+        debug!("Mapping2: 0x{:x}", msg.args64[5]);
         NfyGenericRsp {
             _status: FfaError::Ok.into(),
         }
@@ -75,7 +76,7 @@ impl Service for Notify {
 
     fn ffa_msg_send_direct_req2(&mut self, msg: &FfaMsg) -> Result<FfaMsg> {
         let cmd = msg.extract_u8_at_index(0);
-        println!("Received notify command 0x{:x}", cmd);
+        debug!("Received notify command 0x{:x}", cmd);
 
         // Create new generic rsp packet swap destination and source
         let mut rsp = FfaMsg {
@@ -100,7 +101,7 @@ impl Service for Notify {
                 Ok(rsp)
             }
             _ => {
-                println!("Unknown Notify Command: {}", cmd);
+                error!("Unknown Notify Command: {}", cmd);
                 Err(FfaError::InvalidParameters)
             }
         }

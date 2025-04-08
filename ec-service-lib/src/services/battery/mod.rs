@@ -1,6 +1,7 @@
 use crate::{Result, Service};
 use ffa::msg::FfaMsg;
 use ffa::FfaFunctionId;
+use log::debug;
 use uuid::{uuid, Uuid};
 
 #[derive(Default)]
@@ -30,7 +31,7 @@ impl Service for Battery {
 
     fn ffa_msg_send_direct_req2(&mut self, msg: &FfaMsg) -> Result<FfaMsg> {
         let cmd = msg.extract_u8_at_index(0);
-        println!("Received Battery command 0x{:x}", cmd);
+        debug!("Received Battery command 0x{:x}", cmd);
 
         // Create new generic rsp packet swap destination and source
         let mut rsp = FfaMsg {

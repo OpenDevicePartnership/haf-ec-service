@@ -1,5 +1,8 @@
 {
     "rust-analyzer.check.allTargets": false,
-    "rust-analyzer.cargo.target": "aarch64-unknown-none",
-    "rust-analyzer.cargo.features": "all"
+    "rust-analyzer.cargo.features": "all",
+    "rust-analyzer.check.targets": [
+        "aarch64-unknown-none"
+    ],
+    "rust-analyzer.cargo.target": "aarch64-unknown-none"
 }

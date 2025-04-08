@@ -1,10 +1,9 @@
 //! A panic handler that infinitely waits.
-extern crate ffa; // Remove this after moving to logger
 
 use core::panic::PanicInfo;
 
 use aarch64_cpu::asm;
-use ffa::println;
+use log::error;
 
 /// Stop immediately if called a second time.
 ///
@@ -44,7 +43,7 @@ fn panic(info: &PanicInfo) -> ! {
         _ => ("???", 0, 0),
     };
 
-    println!(
+    error!(
         "Kernel panic!\n\n\
         Panic location:\n      File '{}', line {}, column {}\n\n\
         {}",

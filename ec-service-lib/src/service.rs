@@ -1,4 +1,5 @@
 use ffa::{msg::FfaMsg, FfaError, FfaFunctionId};
+use log::error;
 use uuid::Uuid;
 
 pub type Result<T> = core::result::Result<T, FfaError>;
@@ -19,14 +20,14 @@ pub(crate) trait ServiceImpl: Service {
         match id {
             FfaFunctionId::FfaMsgSendDirectReq2 => self.ffa_msg_send_direct_req2(msg),
             _ => {
-                println!("FfaFunctionId has no handler in {}: {:?}", self.service_name(), id);
+                error!("FfaFunctionId has no handler in {}: {:?}", self.service_name(), id);
                 Err(FfaError::InvalidParameters)
             }
         }
     }
 
     fn handler_unimplemented(&self, msg: &FfaMsg) -> Result<FfaMsg> {
-        println!(
+        error!(
             "FfaFunctionId is unimplemented in {}: {:?}",
             self.service_name(),
             msg.function_id
