@@ -20,6 +20,7 @@ targets = ["aarch64-unknown-none", "aarch64-unknown-none-softfloat"]
 [dependencies]
 uuid = { workspace = true, default-features = false, features = ["v1"] }
 log.workspace = true
+num_enum.workspace = true
 
 [dev-dependencies]
 rstest.workspace = true

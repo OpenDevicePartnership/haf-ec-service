@@ -65,120 +65,90 @@ pub enum Error {
     Other(&'static str),
 }
 
-impl From<ErrorCode> for Error {
-    fn from(value: ErrorCode) -> Self {
-        Error::ErrorCode(value)
+// Define a macro for defining From in a compact way
+macro_rules! define_from_type {
+    ($val:ident => $target:ty {
+        $($type:ty => $($variant:ident$(::)?)+($val_mapped:expr),)*
+    }) => {
+        $(impl From<$type> for $target {
+            fn from($val: $type) -> Self {
+                $($variant)::+($val_mapped)
+            }
+        })*
+    };
+}
+
+define_from_type! {
+    v => Error {
+        ErrorCode => Error::ErrorCode(v),
+        num_enum::TryFromPrimitiveError<FunctionId> => Error::InvalidFunctionId(v.number),
+        num_enum::TryFromPrimitiveError<ErrorCode> => Error::InvalidErrorCode(v.number),
     }
 }
 
 fn try_parse_function_id(func_id: u64) -> Result<FunctionId, Error> {
-    FunctionId::try_from(func_id).map_err(Error::InvalidFunctionId)
+    FunctionId::try_from(func_id).map_err(Error::from)
 }
 
 fn try_parse_error_code(err: u64) -> Result<ErrorCode, Error> {
-    ErrorCode::try_from(err).map_err(Error::InvalidErrorCode)
+    ErrorCode::try_from(err as i64).map_err(Error::from)
 }
 
-macro_rules! define_safe_enum {
-    (
-        $(#[$meta:meta])*
-        $vis:vis enum $name:ident: $type:ty {
-        $(
-            $variant:ident = $value:expr,
-        )*
-    }) => {
-        $(#[$meta])*
-        #[repr($type)]
-        $vis enum $name {
-            $(
-                $variant = $value,
-            )*
-        }
-
-        impl From<$name> for $type {
-            fn from(value: $name) -> Self {
-                value as $type
-            }
-        }
-
-        impl TryFrom<$type> for $name {
-            type Error = $type;
-
-            fn try_from(value: $type) -> core::result::Result<Self, $type> {
-                Ok(match value {
-                    $($value => $name::$variant,)*
-                    _ => return Err(value),
-                })
-            }
-        }
-    };
+#[derive(Debug, Clone, Copy, PartialEq, Eq, num_enum::TryFromPrimitive, num_enum::IntoPrimitive)]
+#[repr(i64)]
+pub enum ErrorCode {
+    Ok = 0,
+    NotSupported = -1,
+    InvalidParameters = -2,
+    NoMemory = -3,
+    Busy = -4,
+    Interrupted = -5,
+    Denied = -6,
+    Retry = -7,
+    Aborted = -8,
+    NoData = -9,
+    NotReady = -10,
 }
 
-define_safe_enum! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum ErrorCode: i64 {
-        Ok = 0,
-        NotSupported = -1,
-        InvalidParameters = -2,
-        NoMemory = -3,
-        Busy = -4,
-        Interrupted = -5,
-        Denied = -6,
-        Retry = -7,
-        Aborted = -8,
-        NoData = -9,
-        NotReady = -10,
-    }
-}
-
-impl TryFrom<u64> for ErrorCode {
-    type Error = i64;
-
-    fn try_from(value: u64) -> core::result::Result<Self, Self::Error> {
-        (value as i64).try_into()
-    }
-}
-
-define_safe_enum! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum FunctionId: u64 {
-        Error = 0x84000060,
-        Success32 = 0x84000061,
-        Success64 = 0xC4000061,
-        Interrupt = 0x84000062,
-        Version = 0x84000063,
-        Features = 0x84000064,
-        RxRelease = 0x84000065,
-        RxTxMap = 0xC4000066,
-        RxTxUnmap = 0x84000067,
-        PartitionInfoGet = 0x84000068,
-        IdGet = 0x84000069,
-        MsgWait = 0x8400006B,
-        MsgYield = 0x8400006C,
-        MsgRun = 0x8400006D,
-        MsgSend = 0x8400006E,
-        MsgSendDirectReq = 0xC400006F,
-        MsgSendDirectResp = 0xC4000070,
-        MsgSend2 = 0x84000086,
-        MsgPoll = 0x8400006A,
-        MemDonate = 0xC4000071,
-        MemLend = 0xC4000072,
-        MemShare = 0xC4000073,
-        MemRetrieveReq = 0x84000074,
-        MemRetrieveResp = 0x84000075,
-        MemRelinquish = 0x84000076,
-        MemReclaim = 0x84000077,
-        MemFragRx = 0x8400007A,
-        MemFragTx = 0x8400007B,
-        NotificationBind = 0x8400007F,
-        NotificationSet = 0x84000081,
-        NotificationGet = 0x84000082,
-        MemPermGet = 0x84000088,
-        MemPermSet = 0x84000089,
-        ConsoleLog = 0xC400008A,
-        MsgSendDirectReq2 = 0xC400008D,
-        MsgSendDirectResp2 = 0xC400008E,
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, num_enum::TryFromPrimitive, num_enum::IntoPrimitive)]
+#[repr(u64)]
+pub enum FunctionId {
+    Error = 0x84000060,
+    Success32 = 0x84000061,
+    Success64 = 0xC4000061,
+    Interrupt = 0x84000062,
+    Version = 0x84000063,
+    Features = 0x84000064,
+    RxRelease = 0x84000065,
+    RxTxMap = 0xC4000066,
+    RxTxUnmap = 0x84000067,
+    PartitionInfoGet = 0x84000068,
+    IdGet = 0x84000069,
+    MsgWait = 0x8400006B,
+    MsgYield = 0x8400006C,
+    MsgRun = 0x8400006D,
+    MsgSend = 0x8400006E,
+    MsgSendDirectReq = 0xC400006F,
+    MsgSendDirectResp = 0xC4000070,
+    MsgSend2 = 0x84000086,
+    MsgPoll = 0x8400006A,
+    MemDonate = 0xC4000071,
+    MemLend = 0xC4000072,
+    MemShare = 0xC4000073,
+    MemRetrieveReq = 0x84000074,
+    MemRetrieveResp = 0x84000075,
+    MemRelinquish = 0x84000076,
+    MemReclaim = 0x84000077,
+    MemFragRx = 0x8400007A,
+    MemFragTx = 0x8400007B,
+    NotificationBind = 0x8400007F,
+    NotificationSet = 0x84000081,
+    NotificationGet = 0x84000082,
+    MemPermGet = 0x84000088,
+    MemPermSet = 0x84000089,
+    ConsoleLog = 0xC400008A,
+    MsgSendDirectReq2 = 0xC400008D,
+    MsgSendDirectResp2 = 0xC400008E,
 }
 
 #[cfg(test)]
