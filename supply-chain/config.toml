@@ -1,0 +1,54 @@
+
+# cargo-vet config file
+
+[cargo-vet]
+version = "0.10"
+
+[imports.OpenDevicePartnership]
+url = "https://raw.githubusercontent.com/OpenDevicePartnership/rust-crate-audits/main/audits.toml"
+
+[imports.google]
+url = "https://raw.githubusercontent.com/google/rust-crate-audits/main/audits.toml"
+
+[imports.mozilla]
+url = "https://raw.githubusercontent.com/mozilla/supply-chain/main/audits.toml"
+
+[[exemptions.aarch64-cpu]]
+version = "10.0.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.aarch64-paging]]
+version = "0.8.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.aarch64-rt]]
+version = "0.1.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.atomic]]
+version = "0.6.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.log]]
+version = "0.4.27"
+criteria = "safe-to-deploy"
+
+[[exemptions.syn]]
+version = "2.0.100"
+criteria = "safe-to-deploy"
+
+[[exemptions.thiserror]]
+version = "2.0.12"
+criteria = "safe-to-deploy"
+
+[[exemptions.thiserror-impl]]
+version = "2.0.12"
+criteria = "safe-to-deploy"
+
+[[exemptions.tock-registers]]
+version = "0.9.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.uuid]]
+version = "1.16.0"
+criteria = "safe-to-deploy"
