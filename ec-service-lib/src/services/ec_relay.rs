@@ -97,6 +97,24 @@ pub fn take_array<const N: usize>(body: &[u8]) -> Result<([u8; N], &[u8]), EcRel
     Ok((*head, rest))
 }
 
+/// Convert an exact-length response body into an owned array.
+///
+/// New fixed-size service parsers use this rather than silently accepting
+/// a trailing suffix.
+#[allow(dead_code)]
+pub fn take_exact_array<const N: usize>(body: &[u8]) -> Result<[u8; N], EcRelayError> {
+    if body.len() < N {
+        return Err(EcRelayError::BodyTooShort);
+    }
+    if body.len() > N {
+        return Err(EcRelayError::BodyTooLong);
+    }
+
+    let mut exact = [0u8; N];
+    exact.copy_from_slice(body);
+    Ok(exact)
+}
+
 // ===========================================================================
 // MctpMessageTrait shims so `MctpPacketContext::serialize_packet` accepts
 // our raw header + body bytes (no full SerializableMessage impl needed).
@@ -181,6 +199,8 @@ pub enum EcRelayError {
     OdpHeaderParse(&'static str),
     /// Response body was shorter than the per-service expected length.
     BodyTooShort,
+    /// Response body was longer than the per-service expected length.
+    BodyTooLong,
 }
 
 /// Transport-agnostic packet I/O. An [`OdpTransport`] knows how to:
@@ -629,5 +649,20 @@ mod tests {
         let mut buf = [0u8; 64];
         let err = t.recv_framed_packet(&mut buf).expect_err("timeout should surface");
         assert_eq!(err, EcRelayError::TransportReadTimeout);
+    }
+
+    #[test]
+    fn take_exact_array_accepts_exact_body() {
+        assert_eq!(take_exact_array::<4>(&[1, 2, 3, 4]), Ok([1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn take_exact_array_rejects_short_body() {
+        assert_eq!(take_exact_array::<4>(&[1, 2, 3]), Err(EcRelayError::BodyTooShort));
+    }
+
+    #[test]
+    fn take_exact_array_rejects_trailing_body() {
+        assert_eq!(take_exact_array::<4>(&[1, 2, 3, 4, 5]), Err(EcRelayError::BodyTooLong));
     }
 }
