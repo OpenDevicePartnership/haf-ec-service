@@ -35,6 +35,8 @@ embedded-services.workspace = true
 battery-service-relay.workspace = true
 battery-service-interface.workspace = true
 thermal-service-relay.workspace = true
+time-alarm-service-relay.workspace = true
+time-alarm-service-interface.workspace = true
 
 [features]
 default = []

@@ -101,7 +101,6 @@ pub fn take_array<const N: usize>(body: &[u8]) -> Result<([u8; N], &[u8]), EcRel
 ///
 /// New fixed-size service parsers use this rather than silently accepting
 /// a trailing suffix.
-#[allow(dead_code)]
 pub fn take_exact_array<const N: usize>(body: &[u8]) -> Result<[u8; N], EcRelayError> {
     if body.len() < N {
         return Err(EcRelayError::BodyTooShort);

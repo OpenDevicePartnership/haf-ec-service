@@ -82,7 +82,7 @@ dependencies = [
 [[package]]
 name = "battery-service-interface"
 version = "0.1.0"
-source = "git+https://github.com/OpenDevicePartnership/embedded-services.git?branch=main#0cadc205b55fe829df3c8cb3accb5cc565422ccc"
+source = "git+https://github.com/OpenDevicePartnership/embedded-services.git?rev=0cadc205b55fe829df3c8cb3accb5cc565422ccc#0cadc205b55fe829df3c8cb3accb5cc565422ccc"
 dependencies = [
  "embedded-batteries-async",
 ]
@@ -90,7 +90,7 @@ dependencies = [
 [[package]]
 name = "battery-service-relay"
 version = "0.1.0"
-source = "git+https://github.com/OpenDevicePartnership/embedded-services.git?branch=main#0cadc205b55fe829df3c8cb3accb5cc565422ccc"
+source = "git+https://github.com/OpenDevicePartnership/embedded-services.git?rev=0cadc205b55fe829df3c8cb3accb5cc565422ccc#0cadc205b55fe829df3c8cb3accb5cc565422ccc"
 dependencies = [
  "battery-service-interface",
  "embedded-services",
@@ -258,6 +258,8 @@ dependencies = [
  "num_enum",
  "odp-ffa",
  "thermal-service-relay",
+ "time-alarm-service-interface",
+ "time-alarm-service-relay",
  "uuid",
 ]
 
@@ -391,6 +393,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "embedded-mcu-hal"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0563f27b8ea59eb57e2c5926db6ee311d0a24ab9912adf82b9f418cc9799b0ff"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "num_enum",
+ "smbus-pec",
+]
+
+[[package]]
 name = "embedded-sensors-hal"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -412,7 +426,7 @@ dependencies = [
 [[package]]
 name = "embedded-services"
 version = "0.1.0"
-source = "git+https://github.com/OpenDevicePartnership/embedded-services.git?branch=main#0cadc205b55fe829df3c8cb3accb5cc565422ccc"
+source = "git+https://github.com/OpenDevicePartnership/embedded-services.git?rev=0cadc205b55fe829df3c8cb3accb5cc565422ccc#0cadc205b55fe829df3c8cb3accb5cc565422ccc"
 dependencies = [
  "bitfield 0.17.0",
  "cortex-m",
@@ -654,7 +668,7 @@ checksum = "616ec5685824bcc94416c6d4a7a446eea774a31efd7062c8480ba6fd06d7a6e5"
 [[package]]
 name = "mctp-rs"
 version = "0.1.0"
-source = "git+https://github.com/OpenDevicePartnership/embedded-services.git?branch=main#0cadc205b55fe829df3c8cb3accb5cc565422ccc"
+source = "git+https://github.com/OpenDevicePartnership/embedded-services.git?rev=0cadc205b55fe829df3c8cb3accb5cc565422ccc#0cadc205b55fe829df3c8cb3accb5cc565422ccc"
 dependencies = [
  "bit-register 0.1.0 (git+https://github.com/OpenDevicePartnership/odp-utilities)",
  "crc",
@@ -998,7 +1012,7 @@ dependencies = [
 [[package]]
 name = "thermal-service-interface"
 version = "0.1.0"
-source = "git+https://github.com/OpenDevicePartnership/embedded-services.git?branch=main#0cadc205b55fe829df3c8cb3accb5cc565422ccc"
+source = "git+https://github.com/OpenDevicePartnership/embedded-services.git?rev=0cadc205b55fe829df3c8cb3accb5cc565422ccc#0cadc205b55fe829df3c8cb3accb5cc565422ccc"
 dependencies = [
  "embassy-time",
  "embedded-fans-async",
@@ -1008,7 +1022,7 @@ dependencies = [
 [[package]]
 name = "thermal-service-relay"
 version = "0.1.0"
-source = "git+https://github.com/OpenDevicePartnership/embedded-services.git?branch=main#0cadc205b55fe829df3c8cb3accb5cc565422ccc"
+source = "git+https://github.com/OpenDevicePartnership/embedded-services.git?rev=0cadc205b55fe829df3c8cb3accb5cc565422ccc#0cadc205b55fe829df3c8cb3accb5cc565422ccc"
 dependencies = [
  "embedded-services",
  "num_enum",
@@ -1034,6 +1048,28 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "time-alarm-service-interface"
+version = "0.1.0"
+source = "git+https://github.com/OpenDevicePartnership/embedded-services.git?rev=0cadc205b55fe829df3c8cb3accb5cc565422ccc#0cadc205b55fe829df3c8cb3accb5cc565422ccc"
+dependencies = [
+ "bitfield 0.17.0",
+ "embedded-mcu-hal",
+ "num_enum",
+ "zerocopy",
+]
+
+[[package]]
+name = "time-alarm-service-relay"
+version = "0.1.0"
+source = "git+https://github.com/OpenDevicePartnership/embedded-services.git?rev=0cadc205b55fe829df3c8cb3accb5cc565422ccc#0cadc205b55fe829df3c8cb3accb5cc565422ccc"
+dependencies = [
+ "embedded-mcu-hal",
+ "embedded-services",
+ "num_enum",
+ "time-alarm-service-interface",
 ]
 
 [[package]]
