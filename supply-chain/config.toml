@@ -82,6 +82,11 @@ version = "0.6.1"
 criteria = "safe-to-deploy"
 notes = "Widely-used embedded-io traits from Embedded WG (Dirbaio). Delta to 0.7.1 covered by ODP import."
 
+[[exemptions.embedded-mcu-hal]]
+version = "0.3.0"
+criteria = "safe-to-run"
+notes = "Dev-only dependency of TimeAlarm relay/interface host compatibility tests."
+
 [[exemptions.embedded-sensors-hal]]
 version = "0.1.1"
 criteria = "safe-to-run"
