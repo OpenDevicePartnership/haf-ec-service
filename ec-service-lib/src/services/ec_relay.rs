@@ -15,29 +15,14 @@
 //! 3. Read a framed response packet back from the transport, MCTP-strip
 //!    it, return the response header + body to the caller.
 //!
-//! This module owns steps 1–3. Per-service SP-side code (e.g.
-//! [`crate::services::battery::Battery`]) defines only the
-//! service-specific bits: service id, message id discriminants,
-//! request/response struct shapes, and `From<&[u8]>` / `Into<Vec<u8>>`
-//! conversions.
+//! This module owns framing, transport I/O, and ODP response-envelope
+//! validation. Per-service shims such as Battery, Thermal, and TimeAlarm
+//! are generic over `R: Relay`; they provide service ids, command ids,
+//! request bodies, and exact response parsers without naming a transport.
 //!
-//! # Transport abstraction
-//!
-//! [`OdpTransport`] decouples the relay framing from the physical wire.
-//! [`MctpSerialTransport`] is the concrete impl for MCTP-via-PL011-UART
-//! used by `qemu-ec-sp`; a hypothetical SmbusEspi transport would
-//! implement the trait identically. Per-service code (`Battery`,
-//! future `Thermal`, etc.) is generic over `T: OdpTransport` and never
-//! sees UART types.
-//!
-//! # Wire-format compatibility
-//!
-//! Bytes produced by [`build_request_header`] + caller-supplied body
-//! are byte-for-byte identical to what
-//! `embedded-services::relay::SerializableMessage::serialize` emits on
-//! the EC side. Drift is caught by the wire-format gate test in
-//! `services::battery::tests` (which round-trips bytes through the EC's
-//! OWN `SerializableMessage` impl).
+//! Bytes produced by [`build_odp_header`] plus each caller's request body
+//! are checked by per-service host wire-format tests against the EC's own
+//! `SerializableMessage` implementations.
 
 use mctp_rs::{
     EndpointId, MctpMedium, MctpMessageHeaderTrait, MctpMessageTag, MctpMessageTrait, MctpPacketContext,
@@ -62,8 +47,10 @@ pub const ODP_MESSAGE_TYPE: u8 = 0x7D;
 /// |--------|-------------|----------|-------------|
 /// | is_req | service_id  | is_error | message_id  |
 ///
-/// `is_error` is always 0 (only success responses are produced
-/// by the EC mock services we proxy to).
+/// This helper constructs SP requests and synthetic success responses.
+/// EC error responses set `is_error` and use the service error
+/// discriminant as `message_id`; host tests construct those with
+/// `test_util::build_odp_error_header`.
 pub fn build_odp_header(is_request: bool, service_id: u8, message_id: u16) -> [u8; 4] {
     let mut raw: u32 = 0;
     if is_request {
@@ -188,10 +175,15 @@ pub enum EcRelayError {
     MctpRecvIncomplete,
     /// Response packet's MCTP message-type byte was not [`ODP_MESSAGE_TYPE`].
     UnexpectedMessageType,
-    /// Response ODP header had an unexpected service-id or message-id.
+    /// Response ODP header had an unexpected service id or a
+    /// successful-response message id.
     UnexpectedOdpService,
     /// Response packet's OdpHeader could not be parsed.
     OdpHeaderParse(&'static str),
+    /// Response packet was marked as an ODP request.
+    UnexpectedOdpRequest,
+    /// EC service returned an error; the value is its error discriminant.
+    Remote(u16),
     /// Response body was shorter than the per-service expected length.
     BodyTooShort,
     /// Response body was longer than the per-service expected length.
@@ -273,7 +265,6 @@ impl<U: embedded_io::Read + embedded_io::Write> OdpTransport for MctpSerialTrans
 ///
 /// Body lifetime is bounded by the closure call in [`invoke`]. Parse
 /// inside the closure; only owned values can escape.
-#[allow(dead_code)] // is_request + is_error are exposed for future callers
 pub struct OdpResponse<'b> {
     pub is_request: bool,
     pub service_id: u8,
@@ -326,7 +317,16 @@ pub trait Relay {
     {
         let request_header = build_odp_header(true, service_id, message_id);
         self.invoke(request_header, request_body, |response| {
-            if response.service_id != service_id || response.message_id != message_id {
+            if response.is_request {
+                return Err(EcRelayError::UnexpectedOdpRequest);
+            }
+            if response.service_id != service_id {
+                return Err(EcRelayError::UnexpectedOdpService);
+            }
+            if response.is_error {
+                return Err(EcRelayError::Remote(response.message_id));
+            }
+            if response.message_id != message_id {
                 return Err(EcRelayError::UnexpectedOdpService);
             }
             parse_body(response.body)
@@ -590,6 +590,13 @@ pub(crate) mod test_util {
         }
     }
 
+    /// Build a 4-byte BE OdpHeader for a synthetic EC error response:
+    /// `is_error` set, with `error_code` in the message-id field.
+    pub fn build_odp_error_header(service_id: u8, error_code: u16) -> [u8; 4] {
+        let raw = ((service_id as u32) << 16) | (1 << 15) | (u32::from(error_code) & 0x7FFF);
+        raw.to_be_bytes()
+    }
+
     /// Helper used by per-service tests: synthesize a framed response
     /// packet from `(response_header, response_body)` by running the
     /// EC-side framing path (TX from EC_EID to SP_EID).
@@ -659,5 +666,41 @@ mod tests {
     #[test]
     fn take_exact_array_rejects_trailing_body() {
         assert_eq!(take_exact_array::<4>(&[1, 2, 3, 4, 5]), Err(EcRelayError::BodyTooLong));
+    }
+
+    #[test]
+    fn invoke_request_preserves_remote_error_code() {
+        let header = test_util::build_odp_error_header(0x09, 1);
+        let framed = test_util::frame_response_packets(header, &[]);
+        let mut transport = test_util::LoopbackTransport::new();
+        transport.prime_rx(framed.iter().copied());
+        let mut relay = EcRelay::new(transport);
+
+        let result = relay.invoke_request(0x09, 4, &[], |_| Ok(()));
+
+        assert_eq!(result, Err(EcRelayError::Remote(1)));
+    }
+
+    #[test]
+    fn invoke_request_rejects_response_marked_as_request() {
+        let header = build_odp_header(true, 0x09, 4);
+        let framed = test_util::frame_response_packets(header, &[]);
+        let mut transport = test_util::LoopbackTransport::new();
+        transport.prime_rx(framed.iter().copied());
+        let mut relay = EcRelay::new(transport);
+
+        let result = relay.invoke_request(0x09, 4, &[], |_| Ok(()));
+
+        assert_eq!(result, Err(EcRelayError::UnexpectedOdpRequest));
+    }
+
+    #[test]
+    fn take_exact_array_accepts_empty_body() {
+        assert_eq!(take_exact_array::<0>(&[]), Ok([]));
+    }
+
+    #[test]
+    fn take_exact_array_rejects_trailing_empty_body() {
+        assert_eq!(take_exact_array::<0>(&[0xAA]), Err(EcRelayError::BodyTooLong));
     }
 }
