@@ -8,6 +8,7 @@ use odp_ffa::{DirectMessagePayload, HasRegisterPayload, MsgSendDirectReq2};
 use thermal_service_relay::{ThermalRequest, ThermalResponse};
 
 mod get_tmp;
+mod thresholds;
 
 fn success_header(command: ThermalCommand) -> [u8; 4] {
     ec_relay::build_odp_header(false, THERMAL_SERVICE_ID, command.into())

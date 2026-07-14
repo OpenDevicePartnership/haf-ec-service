@@ -2,13 +2,14 @@
 //! the EC over MCTP. Mirrors [`crate::services::battery::Battery`].
 //!
 //! Service id `0x09`; commands `GetTmp=1, SetThrs=2, GetThrs=3, SetScp=4,
-//! GetVar=5, SetVar=6`. Only `GetTmp` is relayed so far.
+//! GetVar=5, SetVar=6`. `GetTmp`, `SetThrs`, and `GetThrs` are relayed so
+//! far.
 
 use core::cell::RefCell;
 
 use uuid::{uuid, Uuid};
 
-use crate::services::ec_relay::{take_exact_array, EcRelayError, Relay};
+use crate::services::ec_relay::{take_array, take_exact_array, EcRelayError, Relay};
 use crate::{Result, Service};
 use odp_ffa::{DirectMessagePayload, Error as FfaError, HasRegisterPayload, MsgSendDirectReq2, MsgSendDirectResp2};
 
@@ -46,6 +47,33 @@ fn scalar_payload(value: u32) -> DirectMessagePayload {
     DirectMessagePayload::from_iter(value.to_le_bytes())
 }
 
+/// Reject any body for a command whose success response carries no
+/// payload (e.g. SetThrs); a trailing byte is a wire-format mismatch.
+fn parse_empty_response(body: &[u8]) -> core::result::Result<(), EcRelayError> {
+    take_exact_array::<0>(body).map(|_| ())
+}
+
+/// Collapse a setter round-trip into the AML status word: `0` on
+/// success, the EC's discriminant for a remote error, else the local
+/// sentinel.
+fn setter_status(result: core::result::Result<(), ThermalError>) -> u32 {
+    match result {
+        Ok(()) => 0,
+        Err(ThermalError::Relay(EcRelayError::Remote(code))) => u32::from(code),
+        Err(_) => LOCAL_ERROR_SENTINEL,
+    }
+}
+
+fn threshold_payload(timeout: u32, low: u32, high: u32) -> DirectMessagePayload {
+    DirectMessagePayload::from_iter(
+        timeout
+            .to_le_bytes()
+            .into_iter()
+            .chain(low.to_le_bytes())
+            .chain(high.to_le_bytes()),
+    )
+}
+
 pub struct Thermal<'r, R: Relay> {
     relay: &'r RefCell<R>,
 }
@@ -70,6 +98,54 @@ impl<'r, R: Relay> Thermal<'r, R> {
             )
             .map_err(ThermalError::Relay)
     }
+
+    /// Relay a SetThrs round-trip; the canonical EC body is 13 bytes and a
+    /// successful reply carries no payload.
+    pub fn set_threshold(
+        &self,
+        instance_id: u8,
+        timeout: u32,
+        low: u32,
+        high: u32,
+    ) -> core::result::Result<(), ThermalError> {
+        let mut body = [0u8; 13];
+        body[0] = instance_id;
+        body[1..5].copy_from_slice(&timeout.to_le_bytes());
+        body[5..9].copy_from_slice(&low.to_le_bytes());
+        body[9..13].copy_from_slice(&high.to_le_bytes());
+        self.relay
+            .borrow_mut()
+            .invoke_request(
+                THERMAL_SERVICE_ID,
+                ThermalCommand::SetThrs.into(),
+                &body,
+                parse_empty_response,
+            )
+            .map_err(ThermalError::Relay)
+    }
+
+    /// Relay a GetThrs round-trip; returns the EC's `(timeout, low, high)`
+    /// from an exact 12-byte response.
+    pub fn get_threshold(&self, instance_id: u8) -> core::result::Result<(u32, u32, u32), ThermalError> {
+        self.relay
+            .borrow_mut()
+            .invoke_request(
+                THERMAL_SERVICE_ID,
+                ThermalCommand::GetThrs.into(),
+                &[instance_id],
+                |body| {
+                    let (timeout, body) = take_array(body)?;
+                    let (low, body) = take_array(body)?;
+                    let high = take_exact_array(body)?;
+                    Ok((
+                        u32::from_le_bytes(timeout),
+                        u32::from_le_bytes(low),
+                        u32::from_le_bytes(high),
+                    ))
+                },
+            )
+            .map_err(ThermalError::Relay)
+    }
 }
 
 impl<R: Relay> Service for Thermal<'_, R> {
@@ -88,12 +164,27 @@ impl<R: Relay> Service for Thermal<'_, R> {
                 let value = self.get_temperature(instance_id).unwrap_or(LOCAL_ERROR_SENTINEL);
                 Ok(MsgSendDirectResp2::from_req_with_payload(&msg, scalar_payload(value)))
             }
-            // The other five commands are relayed in a follow-up.
-            ThermalCommand::SetThrs
-            | ThermalCommand::GetThrs
-            | ThermalCommand::SetScp
-            | ThermalCommand::GetVar
-            | ThermalCommand::SetVar => Err(FfaError::Other("Thermal command not yet relayed")),
+            // SetThrs and GetThrs relay to the EC; the rest follow later.
+            ThermalCommand::SetThrs => {
+                let status = setter_status(self.set_threshold(
+                    msg.payload().u8_at(1),
+                    msg.payload().u32_at(2),
+                    msg.payload().u32_at(6),
+                    msg.payload().u32_at(10),
+                ));
+                Ok(MsgSendDirectResp2::from_req_with_payload(&msg, scalar_payload(status)))
+            }
+            ThermalCommand::GetThrs => {
+                let payload = match self.get_threshold(msg.payload().u8_at(1)) {
+                    Ok((timeout, low, high)) => threshold_payload(timeout, low, high),
+                    Err(_) => threshold_payload(LOCAL_ERROR_SENTINEL, LOCAL_ERROR_SENTINEL, LOCAL_ERROR_SENTINEL),
+                };
+                Ok(MsgSendDirectResp2::from_req_with_payload(&msg, payload))
+            }
+            // The remaining commands are relayed in a follow-up.
+            ThermalCommand::SetScp | ThermalCommand::GetVar | ThermalCommand::SetVar => {
+                Err(FfaError::Other("Thermal command not yet relayed"))
+            }
         }
     }
 }
