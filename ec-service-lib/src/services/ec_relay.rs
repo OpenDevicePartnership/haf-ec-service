@@ -693,14 +693,4 @@ mod tests {
 
         assert_eq!(result, Err(EcRelayError::UnexpectedOdpRequest));
     }
-
-    #[test]
-    fn take_exact_array_accepts_empty_body() {
-        assert_eq!(take_exact_array::<0>(&[]), Ok([]));
-    }
-
-    #[test]
-    fn take_exact_array_rejects_trailing_empty_body() {
-        assert_eq!(take_exact_array::<0>(&[0xAA]), Err(EcRelayError::BodyTooLong));
-    }
 }

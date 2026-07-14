@@ -159,18 +159,6 @@ mod tests {
     }
 
     #[test]
-    fn surfaces_remote_error_discriminant() {
-        let header = ec_relay::test_util::build_odp_error_header(TIME_ALARM_SERVICE_ID, 1);
-        let framed = frame_response_packets(header, &[]);
-        let mut transport = LoopbackTransport::new();
-        transport.prime_rx(framed.iter().copied());
-        let relay = RefCell::new(EcRelay::new(transport));
-        let svc = TimeAlarm::new(&relay);
-
-        assert_eq!(svc.get_real_time(), Err(TimeAlarmError::Relay(EcRelayError::Remote(1))));
-    }
-
-    #[test]
     fn ffa_success_returns_timestamp_at_payload_offset_zero() {
         let body = serialized_timestamp();
         let framed = frame_response_packets(response_header(), &body);

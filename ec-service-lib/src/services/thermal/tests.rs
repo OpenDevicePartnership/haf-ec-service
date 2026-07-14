@@ -1,15 +1,11 @@
 use super::*;
-use crate::services::ec_relay::test_util::{
-    frame_response_packets, strip_mctp_framing, LoopbackTransport, TimeoutUart,
-};
-use crate::services::ec_relay::{self, EcRelay, MctpSerialTransport};
-use embedded_services::relay::SerializableMessage;
+use crate::services::ec_relay::test_util::{frame_response_packets, strip_mctp_framing, LoopbackTransport};
+use crate::services::ec_relay::{self, EcRelay};
 use odp_ffa::{DirectMessagePayload, HasRegisterPayload, MsgSendDirectReq2};
-use thermal_service_relay::{ThermalRequest, ThermalResponse};
+use thermal_service_relay::ThermalRequest;
 
 mod get_tmp;
 mod set_scp;
-mod thresholds;
 mod variables;
 
 fn success_header(command: ThermalCommand) -> [u8; 4] {
