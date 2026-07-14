@@ -2,8 +2,8 @@
 //! the EC over MCTP. Mirrors [`crate::services::battery::Battery`].
 //!
 //! Service id `0x09`; commands `GetTmp=1, SetThrs=2, GetThrs=3, SetScp=4,
-//! GetVar=5, SetVar=6`. `GetTmp`, `SetThrs`, and `GetThrs` are relayed so
-//! far.
+//! GetVar=5, SetVar=6`. `GetTmp`, `SetThrs`, `GetThrs`, and `SetScp` are
+//! relayed so far.
 
 use core::cell::RefCell;
 
@@ -146,6 +146,31 @@ impl<'r, R: Relay> Thermal<'r, R> {
             )
             .map_err(ThermalError::Relay)
     }
+
+    /// Relay a SetScp round-trip; the canonical EC body is 13 bytes and a
+    /// successful reply carries no payload.
+    pub fn set_scp(
+        &self,
+        instance_id: u8,
+        policy_id: u32,
+        acoustic_lim: u32,
+        power_lim: u32,
+    ) -> core::result::Result<(), ThermalError> {
+        let mut body = [0u8; 13];
+        body[0] = instance_id;
+        body[1..5].copy_from_slice(&policy_id.to_le_bytes());
+        body[5..9].copy_from_slice(&acoustic_lim.to_le_bytes());
+        body[9..13].copy_from_slice(&power_lim.to_le_bytes());
+        self.relay
+            .borrow_mut()
+            .invoke_request(
+                THERMAL_SERVICE_ID,
+                ThermalCommand::SetScp.into(),
+                &body,
+                parse_empty_response,
+            )
+            .map_err(ThermalError::Relay)
+    }
 }
 
 impl<R: Relay> Service for Thermal<'_, R> {
@@ -181,10 +206,17 @@ impl<R: Relay> Service for Thermal<'_, R> {
                 };
                 Ok(MsgSendDirectResp2::from_req_with_payload(&msg, payload))
             }
-            // The remaining commands are relayed in a follow-up.
-            ThermalCommand::SetScp | ThermalCommand::GetVar | ThermalCommand::SetVar => {
-                Err(FfaError::Other("Thermal command not yet relayed"))
+            ThermalCommand::SetScp => {
+                let status = setter_status(self.set_scp(
+                    msg.payload().u8_at(1),
+                    msg.payload().u32_at(2),
+                    msg.payload().u32_at(6),
+                    msg.payload().u32_at(10),
+                ));
+                Ok(MsgSendDirectResp2::from_req_with_payload(&msg, scalar_payload(status)))
             }
+            // The remaining commands are relayed in a follow-up.
+            ThermalCommand::GetVar | ThermalCommand::SetVar => Err(FfaError::Other("Thermal command not yet relayed")),
         }
     }
 }

@@ -8,6 +8,7 @@ use odp_ffa::{DirectMessagePayload, HasRegisterPayload, MsgSendDirectReq2};
 use thermal_service_relay::{ThermalRequest, ThermalResponse};
 
 mod get_tmp;
+mod set_scp;
 mod thresholds;
 
 fn success_header(command: ThermalCommand) -> [u8; 4] {
