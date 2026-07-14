@@ -10,6 +10,7 @@ use thermal_service_relay::{ThermalRequest, ThermalResponse};
 mod get_tmp;
 mod set_scp;
 mod thresholds;
+mod variables;
 
 fn success_header(command: ThermalCommand) -> [u8; 4] {
     ec_relay::build_odp_header(false, THERMAL_SERVICE_ID, command.into())

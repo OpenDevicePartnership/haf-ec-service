@@ -2,8 +2,11 @@
 //! the EC over MCTP. Mirrors [`crate::services::battery::Battery`].
 //!
 //! Service id `0x09`; commands `GetTmp=1, SetThrs=2, GetThrs=3, SetScp=4,
-//! GetVar=5, SetVar=6`. `GetTmp`, `SetThrs`, `GetThrs`, and `SetScp` are
-//! relayed so far.
+//! GetVar=5, SetVar=6`.
+//!
+//! All six commands are relayed to the EC. FFA requests use one command
+//! byte followed by the canonical EC request body; FFA responses expose
+//! the AML-compatible raw value/status prefix at payload offset zero.
 
 use core::cell::RefCell;
 
@@ -42,6 +45,13 @@ impl From<EcRelayError> for ThermalError {
 /// FFA `GetTmp` reply sentinel: reported at payload offset zero when the
 /// relay round-trip fails locally (AML reads `0xFFFF_FFFF` as an error).
 const LOCAL_ERROR_SENTINEL: u32 = u32::MAX;
+
+/// AML status word for an FFA request the SP rejects before relaying
+/// (e.g. a variable command whose length is not the canonical DWORD).
+const INVALID_PARAMETER_STATUS: u32 = 1;
+
+/// Canonical MPTF variable payload length: a single DWORD value.
+const VARIABLE_VALUE_LEN: u16 = 4;
 
 fn scalar_payload(value: u32) -> DirectMessagePayload {
     DirectMessagePayload::from_iter(value.to_le_bytes())
@@ -171,6 +181,42 @@ impl<'r, R: Relay> Thermal<'r, R> {
             )
             .map_err(ThermalError::Relay)
     }
+
+    /// Relay a GetVar round-trip; encodes the canonical DWORD length and
+    /// raw MPTF UUID, and returns the EC's `u32` value from an exact
+    /// 4-byte response.
+    pub fn get_var(&self, instance_id: u8, uuid_bytes: [u8; 16]) -> core::result::Result<u32, ThermalError> {
+        let mut body = [0u8; 19];
+        body[0] = instance_id;
+        body[1..3].copy_from_slice(&VARIABLE_VALUE_LEN.to_le_bytes());
+        body[3..19].copy_from_slice(&uuid_bytes);
+        self.relay
+            .borrow_mut()
+            .invoke_request(THERMAL_SERVICE_ID, ThermalCommand::GetVar.into(), &body, |body| {
+                let value = take_exact_array::<4>(body)?;
+                Ok(u32::from_le_bytes(value))
+            })
+            .map_err(ThermalError::Relay)
+    }
+
+    /// Relay a SetVar round-trip; encodes the canonical DWORD length and
+    /// raw MPTF UUID, and a successful reply carries no payload.
+    pub fn set_var(&self, instance_id: u8, uuid_bytes: [u8; 16], value: u32) -> core::result::Result<(), ThermalError> {
+        let mut body = [0u8; 23];
+        body[0] = instance_id;
+        body[1..3].copy_from_slice(&VARIABLE_VALUE_LEN.to_le_bytes());
+        body[3..19].copy_from_slice(&uuid_bytes);
+        body[19..23].copy_from_slice(&value.to_le_bytes());
+        self.relay
+            .borrow_mut()
+            .invoke_request(
+                THERMAL_SERVICE_ID,
+                ThermalCommand::SetVar.into(),
+                &body,
+                parse_empty_response,
+            )
+            .map_err(ThermalError::Relay)
+    }
 }
 
 impl<R: Relay> Service for Thermal<'_, R> {
@@ -189,7 +235,6 @@ impl<R: Relay> Service for Thermal<'_, R> {
                 let value = self.get_temperature(instance_id).unwrap_or(LOCAL_ERROR_SENTINEL);
                 Ok(MsgSendDirectResp2::from_req_with_payload(&msg, scalar_payload(value)))
             }
-            // SetThrs and GetThrs relay to the EC; the rest follow later.
             ThermalCommand::SetThrs => {
                 let status = setter_status(self.set_threshold(
                     msg.payload().u8_at(1),
@@ -215,8 +260,29 @@ impl<R: Relay> Service for Thermal<'_, R> {
                 ));
                 Ok(MsgSendDirectResp2::from_req_with_payload(&msg, scalar_payload(status)))
             }
-            // The remaining commands are relayed in a follow-up.
-            ThermalCommand::GetVar | ThermalCommand::SetVar => Err(FfaError::Other("Thermal command not yet relayed")),
+            ThermalCommand::GetVar => {
+                let len = msg.payload().u16_at(2);
+                let value = if len == VARIABLE_VALUE_LEN {
+                    let mut uuid_bytes = [0u8; 16];
+                    uuid_bytes.copy_from_slice(msg.payload().slice(4..20));
+                    self.get_var(msg.payload().u8_at(1), uuid_bytes)
+                        .unwrap_or(LOCAL_ERROR_SENTINEL)
+                } else {
+                    LOCAL_ERROR_SENTINEL
+                };
+                Ok(MsgSendDirectResp2::from_req_with_payload(&msg, scalar_payload(value)))
+            }
+            ThermalCommand::SetVar => {
+                let len = msg.payload().u16_at(2);
+                let status = if len == VARIABLE_VALUE_LEN {
+                    let mut uuid_bytes = [0u8; 16];
+                    uuid_bytes.copy_from_slice(msg.payload().slice(4..20));
+                    setter_status(self.set_var(msg.payload().u8_at(1), uuid_bytes, msg.payload().u32_at(20)))
+                } else {
+                    INVALID_PARAMETER_STATUS
+                };
+                Ok(MsgSendDirectResp2::from_req_with_payload(&msg, scalar_payload(status)))
+            }
         }
     }
 }
