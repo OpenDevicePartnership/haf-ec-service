@@ -132,14 +132,15 @@ fn threshold_payload(timeout: u32, low: u32, high: u32) -> DirectMessagePayload 
 
 /// Borrow a typed request from an FFA payload, skipping the leading
 /// command byte. `ref_from_bytes` requires an exact-length slice, so the
-/// end is fixed at `1 + size_of::<T>()`.
+/// end is fixed at `1 + size_of::<T>()`; a prefix that would run past the
+/// payload end yields `None` instead of panicking.
 fn parse_request<T>(payload: &DirectMessagePayload) -> Option<&T>
 where
     T: FromBytes + KnownLayout + Immutable + Unaligned,
 {
     let start = 1;
     let end = start + size_of::<T>();
-    T::ref_from_bytes(payload.slice(start..end)).ok()
+    T::ref_from_bytes(payload.get(start..end)?).ok()
 }
 
 pub struct Thermal<'r, R: Relay> {
