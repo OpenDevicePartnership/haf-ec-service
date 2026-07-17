@@ -8,9 +8,14 @@
 //! byte followed by the canonical EC request body; FFA responses expose
 //! the AML-compatible raw value/status prefix at payload offset zero.
 
-use core::cell::RefCell;
+use core::{cell::RefCell, mem::size_of};
 
 use uuid::{uuid, Uuid};
+
+use zerocopy::{
+    byteorder::little_endian::{U16, U32},
+    FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned,
+};
 
 use crate::services::ec_relay::{take_array, take_exact_array, EcRelayError, Relay};
 use crate::{Result, Service};
@@ -42,8 +47,49 @@ impl From<EcRelayError> for ThermalError {
     }
 }
 
-/// FFA `GetTmp` reply sentinel: reported at payload offset zero when the
-/// relay round-trip fails locally (AML reads `0xFFFF_FFFF` as an error).
+/// FFA request bodies for the multi-field Thermal commands. Each is the
+/// little-endian EC request payload (command byte stripped); the same
+/// layout drives both FFA decoding and EC serialization via `as_bytes()`.
+/// `IntoBytes` rejects padding at compile time, and the alignment-one
+/// byteorder fields and arrays give these `repr(C)` layouts sizes 13,
+/// 13, 19, and 23.
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct SetThresholdRequest {
+    instance_id: u8,
+    timeout: U32,
+    low: U32,
+    high: U32,
+}
+
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct SetCoolingPolicyRequest {
+    instance_id: u8,
+    policy_id: U32,
+    acoustic_lim: U32,
+    power_lim: U32,
+}
+
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct GetVariableRequest {
+    instance_id: u8,
+    len: U16,
+    uuid: [u8; 16],
+}
+
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct SetVariableRequest {
+    instance_id: u8,
+    len: U16,
+    uuid: [u8; 16],
+    value: U32,
+}
+
+/// FFA getter error sentinel, returned when the relay fails locally or
+/// the EC returns an error (AML reads `0xFFFF_FFFF` as an error).
 const LOCAL_ERROR_SENTINEL: u32 = u32::MAX;
 
 /// AML status word for an FFA request the SP rejects before relaying
@@ -84,6 +130,18 @@ fn threshold_payload(timeout: u32, low: u32, high: u32) -> DirectMessagePayload 
     )
 }
 
+/// Borrow a typed request from an FFA payload, skipping the leading
+/// command byte. `ref_from_bytes` requires an exact-length slice, so the
+/// end is fixed at `1 + size_of::<T>()`.
+fn parse_request<T>(payload: &DirectMessagePayload) -> Option<&T>
+where
+    T: FromBytes + KnownLayout + Immutable + Unaligned,
+{
+    let start = 1;
+    let end = start + size_of::<T>();
+    T::ref_from_bytes(payload.slice(start..end)).ok()
+}
+
 pub struct Thermal<'r, R: Relay> {
     relay: &'r RefCell<R>,
 }
@@ -109,26 +167,15 @@ impl<'r, R: Relay> Thermal<'r, R> {
             .map_err(ThermalError::Relay)
     }
 
-    /// Relay a SetThrs round-trip; the canonical EC body is 13 bytes and a
-    /// successful reply carries no payload.
-    pub fn set_threshold(
-        &self,
-        instance_id: u8,
-        timeout: u32,
-        low: u32,
-        high: u32,
-    ) -> core::result::Result<(), ThermalError> {
-        let mut body = [0u8; 13];
-        body[0] = instance_id;
-        body[1..5].copy_from_slice(&timeout.to_le_bytes());
-        body[5..9].copy_from_slice(&low.to_le_bytes());
-        body[9..13].copy_from_slice(&high.to_le_bytes());
+    /// Relay a SetThrs round-trip; the typed request is the canonical
+    /// 13-byte EC body and a successful reply carries no payload.
+    fn set_threshold(&self, request: &SetThresholdRequest) -> core::result::Result<(), ThermalError> {
         self.relay
             .borrow_mut()
             .invoke_request(
                 THERMAL_SERVICE_ID,
                 ThermalCommand::SetThrs.into(),
-                &body,
+                request.as_bytes(),
                 parse_empty_response,
             )
             .map_err(ThermalError::Relay)
@@ -157,62 +204,47 @@ impl<'r, R: Relay> Thermal<'r, R> {
             .map_err(ThermalError::Relay)
     }
 
-    /// Relay a SetScp round-trip; the canonical EC body is 13 bytes and a
-    /// successful reply carries no payload.
-    pub fn set_scp(
-        &self,
-        instance_id: u8,
-        policy_id: u32,
-        acoustic_lim: u32,
-        power_lim: u32,
-    ) -> core::result::Result<(), ThermalError> {
-        let mut body = [0u8; 13];
-        body[0] = instance_id;
-        body[1..5].copy_from_slice(&policy_id.to_le_bytes());
-        body[5..9].copy_from_slice(&acoustic_lim.to_le_bytes());
-        body[9..13].copy_from_slice(&power_lim.to_le_bytes());
+    /// Relay a SetScp round-trip; the typed request is the canonical
+    /// 13-byte EC body and a successful reply carries no payload.
+    fn set_scp(&self, request: &SetCoolingPolicyRequest) -> core::result::Result<(), ThermalError> {
         self.relay
             .borrow_mut()
             .invoke_request(
                 THERMAL_SERVICE_ID,
                 ThermalCommand::SetScp.into(),
-                &body,
+                request.as_bytes(),
                 parse_empty_response,
             )
             .map_err(ThermalError::Relay)
     }
 
-    /// Relay a GetVar round-trip; encodes the canonical DWORD length and
-    /// raw MPTF UUID, and returns the EC's `u32` value from an exact
+    /// Relay a GetVar round-trip; the typed request is the canonical
+    /// 19-byte EC body and the EC's `u32` value comes from an exact
     /// 4-byte response.
-    pub fn get_var(&self, instance_id: u8, uuid_bytes: [u8; 16]) -> core::result::Result<u32, ThermalError> {
-        let mut body = [0u8; 19];
-        body[0] = instance_id;
-        body[1..3].copy_from_slice(&VARIABLE_VALUE_LEN.to_le_bytes());
-        body[3..19].copy_from_slice(&uuid_bytes);
+    fn get_var(&self, request: &GetVariableRequest) -> core::result::Result<u32, ThermalError> {
         self.relay
             .borrow_mut()
-            .invoke_request(THERMAL_SERVICE_ID, ThermalCommand::GetVar.into(), &body, |body| {
-                let value = take_exact_array::<4>(body)?;
-                Ok(u32::from_le_bytes(value))
-            })
+            .invoke_request(
+                THERMAL_SERVICE_ID,
+                ThermalCommand::GetVar.into(),
+                request.as_bytes(),
+                |body| {
+                    let value = take_exact_array::<4>(body)?;
+                    Ok(u32::from_le_bytes(value))
+                },
+            )
             .map_err(ThermalError::Relay)
     }
 
-    /// Relay a SetVar round-trip; encodes the canonical DWORD length and
-    /// raw MPTF UUID, and a successful reply carries no payload.
-    pub fn set_var(&self, instance_id: u8, uuid_bytes: [u8; 16], value: u32) -> core::result::Result<(), ThermalError> {
-        let mut body = [0u8; 23];
-        body[0] = instance_id;
-        body[1..3].copy_from_slice(&VARIABLE_VALUE_LEN.to_le_bytes());
-        body[3..19].copy_from_slice(&uuid_bytes);
-        body[19..23].copy_from_slice(&value.to_le_bytes());
+    /// Relay a SetVar round-trip; the typed request is the canonical
+    /// 23-byte EC body and a successful reply carries no payload.
+    fn set_var(&self, request: &SetVariableRequest) -> core::result::Result<(), ThermalError> {
         self.relay
             .borrow_mut()
             .invoke_request(
                 THERMAL_SERVICE_ID,
                 ThermalCommand::SetVar.into(),
-                &body,
+                request.as_bytes(),
                 parse_empty_response,
             )
             .map_err(ThermalError::Relay)
@@ -236,12 +268,9 @@ impl<R: Relay> Service for Thermal<'_, R> {
                 Ok(MsgSendDirectResp2::from_req_with_payload(&msg, scalar_payload(value)))
             }
             ThermalCommand::SetThrs => {
-                let status = setter_status(self.set_threshold(
-                    msg.payload().u8_at(1),
-                    msg.payload().u32_at(2),
-                    msg.payload().u32_at(6),
-                    msg.payload().u32_at(10),
-                ));
+                let status = parse_request::<SetThresholdRequest>(msg.payload())
+                    .map(|request| setter_status(self.set_threshold(request)))
+                    .unwrap_or(LOCAL_ERROR_SENTINEL);
                 Ok(MsgSendDirectResp2::from_req_with_payload(&msg, scalar_payload(status)))
             }
             ThermalCommand::GetThrs => {
@@ -252,34 +281,25 @@ impl<R: Relay> Service for Thermal<'_, R> {
                 Ok(MsgSendDirectResp2::from_req_with_payload(&msg, payload))
             }
             ThermalCommand::SetScp => {
-                let status = setter_status(self.set_scp(
-                    msg.payload().u8_at(1),
-                    msg.payload().u32_at(2),
-                    msg.payload().u32_at(6),
-                    msg.payload().u32_at(10),
-                ));
+                let status = parse_request::<SetCoolingPolicyRequest>(msg.payload())
+                    .map(|request| setter_status(self.set_scp(request)))
+                    .unwrap_or(LOCAL_ERROR_SENTINEL);
                 Ok(MsgSendDirectResp2::from_req_with_payload(&msg, scalar_payload(status)))
             }
             ThermalCommand::GetVar => {
-                let len = msg.payload().u16_at(2);
-                let value = if len == VARIABLE_VALUE_LEN {
-                    let mut uuid_bytes = [0u8; 16];
-                    uuid_bytes.copy_from_slice(msg.payload().slice(4..20));
-                    self.get_var(msg.payload().u8_at(1), uuid_bytes)
-                        .unwrap_or(LOCAL_ERROR_SENTINEL)
-                } else {
-                    LOCAL_ERROR_SENTINEL
+                let value = match parse_request::<GetVariableRequest>(msg.payload()) {
+                    Some(request) if request.len.get() == VARIABLE_VALUE_LEN => {
+                        self.get_var(request).unwrap_or(LOCAL_ERROR_SENTINEL)
+                    }
+                    _ => LOCAL_ERROR_SENTINEL,
                 };
                 Ok(MsgSendDirectResp2::from_req_with_payload(&msg, scalar_payload(value)))
             }
             ThermalCommand::SetVar => {
-                let len = msg.payload().u16_at(2);
-                let status = if len == VARIABLE_VALUE_LEN {
-                    let mut uuid_bytes = [0u8; 16];
-                    uuid_bytes.copy_from_slice(msg.payload().slice(4..20));
-                    setter_status(self.set_var(msg.payload().u8_at(1), uuid_bytes, msg.payload().u32_at(20)))
-                } else {
-                    INVALID_PARAMETER_STATUS
+                let status = match parse_request::<SetVariableRequest>(msg.payload()) {
+                    Some(request) if request.len.get() == VARIABLE_VALUE_LEN => setter_status(self.set_var(request)),
+                    Some(_) => INVALID_PARAMETER_STATUS,
+                    None => LOCAL_ERROR_SENTINEL,
                 };
                 Ok(MsgSendDirectResp2::from_req_with_payload(&msg, scalar_payload(status)))
             }

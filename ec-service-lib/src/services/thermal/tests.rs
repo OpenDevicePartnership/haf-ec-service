@@ -5,6 +5,7 @@ use odp_ffa::{DirectMessagePayload, HasRegisterPayload, MsgSendDirectReq2};
 use thermal_service_relay::ThermalRequest;
 
 mod get_tmp;
+mod request_layout;
 mod set_scp;
 mod variables;
 

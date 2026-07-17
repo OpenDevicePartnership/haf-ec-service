@@ -1,12 +1,19 @@
 use super::*;
 use embedded_services::relay::SerializableMessage;
+use zerocopy::byteorder::little_endian::U32;
 
 #[test]
 fn set_scp_produces_canonical_request_bytes() {
     let relay = relay_with_response(success_header(ThermalCommand::SetScp), &[]);
     let svc = Thermal::new(&relay);
 
-    svc.set_scp(0, 1, 75, 25).expect("synthetic success");
+    let request = SetCoolingPolicyRequest {
+        instance_id: 0,
+        policy_id: U32::new(1),
+        acoustic_lim: U32::new(75),
+        power_lim: U32::new(25),
+    };
+    svc.set_scp(&request).expect("synthetic success");
 
     let inner = transmitted_inner(&relay);
     let decoded = ThermalRequest::deserialize(u16::from(ThermalCommand::SetScp), &inner[4..])
