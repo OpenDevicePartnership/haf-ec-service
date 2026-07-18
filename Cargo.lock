@@ -261,6 +261,7 @@ dependencies = [
  "time-alarm-service-interface",
  "time-alarm-service-relay",
  "uuid",
+ "zerocopy",
 ]
 
 [[package]]

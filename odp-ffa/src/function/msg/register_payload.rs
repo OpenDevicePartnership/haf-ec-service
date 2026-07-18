@@ -49,6 +49,15 @@ impl DirectMessagePayload {
     pub fn slice(&self, range: Range<usize>) -> &[u8] {
         &self.0[range]
     }
+
+    /// Bounds-checked counterpart to [`Self::slice`]/indexing, mirroring
+    /// `slice::get`: returns `None` when the index is out of range.
+    pub fn get<I>(&self, index: I) -> Option<&I::Output>
+    where
+        I: core::slice::SliceIndex<[u8]>,
+    {
+        self.0.get(index)
+    }
 }
 
 pub trait HasRegisterPayload {

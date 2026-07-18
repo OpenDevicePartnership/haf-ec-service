@@ -177,9 +177,8 @@ mod tests {
 
     #[test]
     fn ffa_error_envelope_returns_invalid_zero_timestamp() {
-        let raw =
-            ((TIME_ALARM_SERVICE_ID as u32) << 16) | (1 << 15) | u32::from(u16::from(TimeAlarmCommand::GetRealTime));
-        let framed = frame_response_packets(raw.to_be_bytes(), &[]);
+        let header = ec_relay::test_util::build_odp_error_header(TIME_ALARM_SERVICE_ID, 1);
+        let framed = frame_response_packets(header, &[]);
         let mut transport = LoopbackTransport::new();
         transport.prime_rx(framed.iter().copied());
         let relay = RefCell::new(EcRelay::new(transport));
