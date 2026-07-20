@@ -301,10 +301,8 @@ pub trait Relay {
     where
         F: FnOnce(OdpResponse<'_>) -> Result<R, EcRelayError>;
 
-    /// Build the request header, invoke, and validate the response
-    /// envelope (same service + message id) before handing the body to
-    /// `parse_body`, which validates its own length/shape and returns an
-    /// `EcRelayError` on a mismatch.
+    /// Build a request and validate a success response whose discriminant is
+    /// the same as the request message id.
     fn invoke_request<R, F>(
         &mut self,
         service_id: u8,
@@ -315,7 +313,23 @@ pub trait Relay {
     where
         F: FnOnce(&[u8]) -> Result<R, EcRelayError>,
     {
-        let request_header = build_odp_header(true, service_id, message_id);
+        self.invoke_request_with_response_id(service_id, message_id, message_id, request_body, parse_body)
+    }
+
+    /// Build a request and validate a success response with an explicit
+    /// response discriminant before parsing its body.
+    fn invoke_request_with_response_id<R, F>(
+        &mut self,
+        service_id: u8,
+        request_message_id: u16,
+        expected_response_message_id: u16,
+        request_body: &[u8],
+        parse_body: F,
+    ) -> Result<R, EcRelayError>
+    where
+        F: FnOnce(&[u8]) -> Result<R, EcRelayError>,
+    {
+        let request_header = build_odp_header(true, service_id, request_message_id);
         self.invoke(request_header, request_body, |response| {
             if response.is_request {
                 return Err(EcRelayError::UnexpectedOdpRequest);
@@ -326,7 +340,7 @@ pub trait Relay {
             if response.is_error {
                 return Err(EcRelayError::Remote(response.message_id));
             }
-            if response.message_id != message_id {
+            if response.message_id != expected_response_message_id {
                 return Err(EcRelayError::UnexpectedOdpService);
             }
             parse_body(response.body)
@@ -666,6 +680,48 @@ mod tests {
     #[test]
     fn take_exact_array_rejects_trailing_body() {
         assert_eq!(take_exact_array::<4>(&[1, 2, 3, 4, 5]), Err(EcRelayError::BodyTooLong));
+    }
+
+    #[test]
+    fn invoke_request_with_response_id_accepts_distinct_success_id() {
+        let header = build_odp_header(false, 0x0B, 5);
+        let body = 300u32.to_le_bytes();
+        let framed = test_util::frame_response_packets(header, &body);
+        let mut transport = test_util::LoopbackTransport::new();
+        transport.prime_rx(framed.iter().copied());
+        let mut relay = EcRelay::new(transport);
+
+        let result = relay.invoke_request_with_response_id(0x0B, 7, 5, &[], |body| {
+            Ok(u32::from_le_bytes(take_exact_array::<4>(body)?))
+        });
+
+        assert_eq!(result, Ok(300));
+    }
+
+    #[test]
+    fn invoke_request_with_response_id_rejects_wrong_success_id() {
+        let header = build_odp_header(false, 0x0B, 7);
+        let framed = test_util::frame_response_packets(header, &300u32.to_le_bytes());
+        let mut transport = test_util::LoopbackTransport::new();
+        transport.prime_rx(framed.iter().copied());
+        let mut relay = EcRelay::new(transport);
+
+        let result = relay.invoke_request_with_response_id(0x0B, 7, 5, &[], |_| Ok(()));
+
+        assert_eq!(result, Err(EcRelayError::UnexpectedOdpService));
+    }
+
+    #[test]
+    fn invoke_request_with_response_id_preserves_remote_error() {
+        let header = test_util::build_odp_error_header(0x0B, 1);
+        let framed = test_util::frame_response_packets(header, &[]);
+        let mut transport = test_util::LoopbackTransport::new();
+        transport.prime_rx(framed.iter().copied());
+        let mut relay = EcRelay::new(transport);
+
+        let result = relay.invoke_request_with_response_id(0x0B, 7, 5, &[], |_| Ok(()));
+
+        assert_eq!(result, Err(EcRelayError::Remote(1)));
     }
 
     #[test]
