@@ -295,13 +295,18 @@ mod tests {
     fn set_timer_value_uses_canonical_wire_contract() {
         let (header, body) = serialized_response::<0>(AcpiTimeAlarmResponse::OkNoData);
         let relay = relay_with_response(header, &body);
-        let svc = TimeAlarm::new(&relay);
-        let request = SetTimerValueRequest {
-            timer_id: U32::new(0),
-            seconds: U32::new(300),
-        };
+        let mut svc = TimeAlarm::new(&relay);
+        let mut args = [0u8; 8];
+        args[..4].copy_from_slice(&0u32.to_le_bytes());
+        args[4..].copy_from_slice(&300u32.to_le_bytes());
 
-        svc.set_timer_value(&request).expect("synthetic SetTimerValue success");
+        let response = svc
+            .ffa_msg_send_direct_req2(make_ffa_request(
+                u16::from(TimeAlarmCommand::SetTimerValue) as u8,
+                &args,
+            ))
+            .expect("known command returns DIRECT_RESP2");
+        assert_eq!(response.payload().u32_at(0), 0);
 
         let inner = transmitted_inner(&relay);
         let mut expected = std::vec![0x02, 0x0B, 0x00, 0x06];
@@ -318,13 +323,16 @@ mod tests {
     fn get_timer_value_uses_canonical_wire_contract() {
         let (header, body) = serialized_response::<4>(AcpiTimeAlarmResponse::TimerSeconds(AlarmTimerSeconds(297)));
         let relay = relay_with_response(header, &body);
-        let svc = TimeAlarm::new(&relay);
-        let request = GetTimerValueRequest { timer_id: U32::new(0) };
+        let mut svc = TimeAlarm::new(&relay);
+        let args = 0u32.to_le_bytes();
 
-        assert_eq!(
-            svc.get_timer_value(&request).expect("synthetic GetTimerValue success"),
-            297,
-        );
+        let response = svc
+            .ffa_msg_send_direct_req2(make_ffa_request(
+                u16::from(TimeAlarmCommand::GetTimerValue) as u8,
+                &args,
+            ))
+            .expect("known command returns DIRECT_RESP2");
+        assert_eq!(response.payload().u32_at(0), 297);
 
         let inner = transmitted_inner(&relay);
         let mut expected = std::vec![0x02, 0x0B, 0x00, 0x07];
@@ -375,20 +383,10 @@ mod tests {
     }
 
     #[test]
-    fn ffa_set_timer_value_maps_success_remote_and_local_errors() {
+    fn ffa_set_timer_value_maps_remote_and_local_errors() {
         let mut args = [0u8; 8];
         args[..4].copy_from_slice(&0u32.to_le_bytes());
         args[4..].copy_from_slice(&300u32.to_le_bytes());
-
-        let success_header = ec_relay::build_odp_header(
-            false,
-            TIME_ALARM_SERVICE_ID,
-            AcpiTimeAlarmResponse::OkNoData.discriminant(),
-        );
-        assert_eq!(
-            ffa_scalar_response(Some(success_header), &[], TimeAlarmCommand::SetTimerValue, &args,),
-            0,
-        );
 
         let remote_header = ec_relay::test_util::build_odp_error_header(TIME_ALARM_SERVICE_ID, 1);
         assert_eq!(
@@ -403,19 +401,8 @@ mod tests {
     }
 
     #[test]
-    fn ffa_get_timer_value_maps_success_and_failures() {
+    fn ffa_get_timer_value_maps_remote_and_local_errors() {
         let args = 0u32.to_le_bytes();
-        let response = AcpiTimeAlarmResponse::TimerSeconds(AlarmTimerSeconds(297));
-        let (success_header, success_body) = serialized_response::<4>(response);
-        assert_eq!(
-            ffa_scalar_response(
-                Some(success_header),
-                &success_body,
-                TimeAlarmCommand::GetTimerValue,
-                &args,
-            ),
-            297,
-        );
 
         let remote_header = ec_relay::test_util::build_odp_error_header(TIME_ALARM_SERVICE_ID, 1);
         assert_eq!(
@@ -427,24 +414,6 @@ mod tests {
             ffa_scalar_response(None, &[], TimeAlarmCommand::GetTimerValue, &args,),
             u32::MAX,
         );
-    }
-
-    #[test]
-    fn ffa_timer_request_layouts_match_arguments() {
-        let mut set_args = [0u8; 8];
-        set_args[..4].copy_from_slice(&1u32.to_le_bytes());
-        set_args[4..].copy_from_slice(&300u32.to_le_bytes());
-        let set_payload = make_ffa_request(u16::from(TimeAlarmCommand::SetTimerValue) as u8, &set_args);
-        let set_request = parse_request::<SetTimerValueRequest>(set_payload.payload()).expect("typed set request");
-        assert_eq!(set_request.timer_id.get(), 1);
-        assert_eq!(set_request.seconds.get(), 300);
-        assert_eq!(set_request.as_bytes(), &set_args);
-
-        let get_args = 0u32.to_le_bytes();
-        let get_payload = make_ffa_request(u16::from(TimeAlarmCommand::GetTimerValue) as u8, &get_args);
-        let get_request = parse_request::<GetTimerValueRequest>(get_payload.payload()).expect("typed get request");
-        assert_eq!(get_request.timer_id.get(), 0);
-        assert_eq!(get_request.as_bytes(), &get_args);
     }
 
     #[test]

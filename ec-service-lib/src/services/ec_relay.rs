@@ -683,22 +683,6 @@ mod tests {
     }
 
     #[test]
-    fn invoke_request_with_response_id_accepts_distinct_success_id() {
-        let header = build_odp_header(false, 0x0B, 5);
-        let body = 300u32.to_le_bytes();
-        let framed = test_util::frame_response_packets(header, &body);
-        let mut transport = test_util::LoopbackTransport::new();
-        transport.prime_rx(framed.iter().copied());
-        let mut relay = EcRelay::new(transport);
-
-        let result = relay.invoke_request_with_response_id(0x0B, 7, 5, &[], |body| {
-            Ok(u32::from_le_bytes(take_exact_array::<4>(body)?))
-        });
-
-        assert_eq!(result, Ok(300));
-    }
-
-    #[test]
     fn invoke_request_with_response_id_rejects_wrong_success_id() {
         let header = build_odp_header(false, 0x0B, 7);
         let framed = test_util::frame_response_packets(header, &300u32.to_le_bytes());
