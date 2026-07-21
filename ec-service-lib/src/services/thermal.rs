@@ -8,7 +8,7 @@
 //! byte followed by the canonical EC request body; FFA responses expose
 //! the AML-compatible raw value/status prefix at payload offset zero.
 
-use core::{cell::RefCell, mem::size_of};
+use core::cell::RefCell;
 
 use uuid::{uuid, Uuid};
 
@@ -17,6 +17,7 @@ use zerocopy::{
     FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned,
 };
 
+use super::parse_ffa_request;
 use crate::services::ec_relay::{take_array, take_exact_array, EcRelayError, Relay};
 use crate::{Result, Service};
 use odp_ffa::{DirectMessagePayload, Error as FfaError, HasRegisterPayload, MsgSendDirectReq2, MsgSendDirectResp2};
@@ -128,19 +129,6 @@ fn threshold_payload(timeout: u32, low: u32, high: u32) -> DirectMessagePayload 
             .chain(low.to_le_bytes())
             .chain(high.to_le_bytes()),
     )
-}
-
-/// Borrow a typed request from an FFA payload, skipping the leading
-/// command byte. `ref_from_bytes` requires an exact-length slice, so the
-/// end is fixed at `1 + size_of::<T>()`; a prefix that would run past the
-/// payload end yields `None` instead of panicking.
-fn parse_request<T>(payload: &DirectMessagePayload) -> Option<&T>
-where
-    T: FromBytes + KnownLayout + Immutable + Unaligned,
-{
-    let start = 1;
-    let end = start + size_of::<T>();
-    T::ref_from_bytes(payload.get(start..end)?).ok()
 }
 
 pub struct Thermal<'r, R: Relay> {
@@ -269,7 +257,7 @@ impl<R: Relay> Service for Thermal<'_, R> {
                 Ok(MsgSendDirectResp2::from_req_with_payload(&msg, scalar_payload(value)))
             }
             ThermalCommand::SetThrs => {
-                let status = parse_request::<SetThresholdRequest>(msg.payload())
+                let status = parse_ffa_request::<SetThresholdRequest>(msg.payload())
                     .map(|request| setter_status(self.set_threshold(request)))
                     .unwrap_or(LOCAL_ERROR_SENTINEL);
                 Ok(MsgSendDirectResp2::from_req_with_payload(&msg, scalar_payload(status)))
@@ -282,13 +270,13 @@ impl<R: Relay> Service for Thermal<'_, R> {
                 Ok(MsgSendDirectResp2::from_req_with_payload(&msg, payload))
             }
             ThermalCommand::SetScp => {
-                let status = parse_request::<SetCoolingPolicyRequest>(msg.payload())
+                let status = parse_ffa_request::<SetCoolingPolicyRequest>(msg.payload())
                     .map(|request| setter_status(self.set_scp(request)))
                     .unwrap_or(LOCAL_ERROR_SENTINEL);
                 Ok(MsgSendDirectResp2::from_req_with_payload(&msg, scalar_payload(status)))
             }
             ThermalCommand::GetVar => {
-                let value = match parse_request::<GetVariableRequest>(msg.payload()) {
+                let value = match parse_ffa_request::<GetVariableRequest>(msg.payload()) {
                     Some(request) if request.len.get() == VARIABLE_VALUE_LEN => {
                         self.get_var(request).unwrap_or(LOCAL_ERROR_SENTINEL)
                     }
@@ -297,7 +285,7 @@ impl<R: Relay> Service for Thermal<'_, R> {
                 Ok(MsgSendDirectResp2::from_req_with_payload(&msg, scalar_payload(value)))
             }
             ThermalCommand::SetVar => {
-                let status = match parse_request::<SetVariableRequest>(msg.payload()) {
+                let status = match parse_ffa_request::<SetVariableRequest>(msg.payload()) {
                     Some(request) if request.len.get() == VARIABLE_VALUE_LEN => setter_status(self.set_var(request)),
                     Some(_) => INVALID_PARAMETER_STATUS,
                     None => LOCAL_ERROR_SENTINEL,
