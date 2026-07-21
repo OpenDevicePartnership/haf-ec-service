@@ -1,8 +1,9 @@
-use core::{cell::RefCell, mem::size_of};
+use core::cell::RefCell;
 
 use uuid::{uuid, Uuid};
 use zerocopy::{byteorder::little_endian::U32, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
+use super::parse_ffa_request;
 use crate::services::ec_relay::{take_exact_array, EcRelayError, Relay};
 use crate::{Result, Service};
 use odp_ffa::{DirectMessagePayload, Error as FfaError, HasRegisterPayload, MsgSendDirectReq2, MsgSendDirectResp2};
@@ -56,15 +57,6 @@ fn setter_status(result: core::result::Result<(), TimeAlarmError>) -> u32 {
         Err(TimeAlarmError::Relay(EcRelayError::Remote(code))) => u32::from(code),
         Err(_) => LOCAL_ERROR_SENTINEL,
     }
-}
-
-fn parse_request<T>(payload: &DirectMessagePayload) -> Option<&T>
-where
-    T: FromBytes + KnownLayout + Immutable + Unaligned,
-{
-    let start = 1;
-    let end = start + size_of::<T>();
-    T::ref_from_bytes(payload.get(start..end)?).ok()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,13 +138,13 @@ impl<R: Relay> Service for TimeAlarm<'_, R> {
                 ))
             }
             TimeAlarmCommand::SetTimerValue => {
-                let status = parse_request::<SetTimerValueRequest>(msg.payload())
+                let status = parse_ffa_request::<SetTimerValueRequest>(msg.payload())
                     .map(|request| setter_status(self.set_timer_value(request)))
                     .unwrap_or(LOCAL_ERROR_SENTINEL);
                 Ok(MsgSendDirectResp2::from_req_with_payload(&msg, scalar_payload(status)))
             }
             TimeAlarmCommand::GetTimerValue => {
-                let value = parse_request::<GetTimerValueRequest>(msg.payload())
+                let value = parse_ffa_request::<GetTimerValueRequest>(msg.payload())
                     .map(|request| self.get_timer_value(request).unwrap_or(LOCAL_ERROR_SENTINEL))
                     .unwrap_or(LOCAL_ERROR_SENTINEL);
                 Ok(MsgSendDirectResp2::from_req_with_payload(&msg, scalar_payload(value)))
@@ -414,12 +406,6 @@ mod tests {
             ffa_scalar_response(None, &[], TimeAlarmCommand::GetTimerValue, &args,),
             u32::MAX,
         );
-    }
-
-    #[test]
-    fn ffa_timer_request_parser_rejects_oversized_type() {
-        let payload = DirectMessagePayload::from_iter(core::iter::empty());
-        assert!(parse_request::<[u8; 112]>(&payload).is_none());
     }
 
     #[test]
