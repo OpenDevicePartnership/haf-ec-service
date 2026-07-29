@@ -42,7 +42,7 @@ use uuid::{uuid, Uuid};
 
 use crate::services::ec_relay::{take_array, EcRelayError, Relay};
 use crate::{Result, Service};
-use odp_ffa::{Error as FfaError, MsgSendDirectReq2, MsgSendDirectResp2};
+use odp_ffa::{Error as FfaError, HasRegisterPayload, MsgSendDirectReq2, MsgSendDirectResp2};
 
 /// Battery service id in the EC's `OdpRelayHandler` instantiation
 /// (canonical value at
@@ -130,10 +130,11 @@ impl<R: Relay> Service for Battery<'_, R> {
     const NAME: &'static str = "Battery";
 
     fn ffa_msg_send_direct_req2(&mut self, msg: MsgSendDirectReq2) -> Result<MsgSendDirectResp2> {
-        // The EFI test-app sends a single GetBst with battery_id = 0
-        // (UEFI parses no payload bytes for this round-trip). Future
-        // callers may extract `battery_id` from msg.payload().u8_at(0).
-        match self.get_bst(0) {
+        if msg.payload().u8_at(0) as u16 != BATTERY_CMD_GET_BST {
+            return Err(FfaError::Other("Unknown Battery Command"));
+        }
+        let battery_id = msg.payload().u8_at(1);
+        match self.get_bst(battery_id) {
             Ok(bst) => {
                 // Pack the 16 BST bytes as 4 LE u32 dwords across the
                 // direct-message register payload (mirrors notify.rs's
@@ -176,6 +177,7 @@ mod tests {
     use battery_service_interface::{BatteryState, BstReturn};
     use battery_service_relay::{AcpiBatteryRequest, AcpiBatteryResponse};
     use embedded_services::relay::SerializableMessage;
+    use odp_ffa::{DirectMessagePayload, HasRegisterPayload};
 
     fn canned_bst() -> BstReturn {
         BstReturn {
@@ -240,5 +242,64 @@ mod tests {
         assert_eq!(result.battery_present_rate, bst.battery_present_rate);
         assert_eq!(result.battery_remaining_capacity, bst.battery_remaining_capacity);
         assert_eq!(result.battery_present_voltage, bst.battery_present_voltage);
+    }
+
+    fn relay_primed_with_bst(bst: BstReturn) -> RefCell<EcRelay<LoopbackTransport>> {
+        let mut response_payload = [0u8; 16];
+        AcpiBatteryResponse::GetBst { bst }
+            .serialize(&mut response_payload)
+            .expect("ec-side serialize");
+        let header = ec_relay::build_odp_header(false, BATTERY_SERVICE_ID, BATTERY_CMD_GET_BST);
+        let framed = frame_response_packets(header, &response_payload);
+        let mut transport = LoopbackTransport::new();
+        transport.prime_rx(framed.iter().copied());
+        RefCell::new(EcRelay::new(transport))
+    }
+
+    fn make_ffa_request(opcode: u8, battery_id: u8) -> MsgSendDirectReq2 {
+        MsgSendDirectReq2::new(
+            0x0001,
+            0x8001,
+            Battery::<EcRelay<LoopbackTransport>>::UUID,
+            DirectMessagePayload::from_iter([opcode, battery_id]),
+        )
+    }
+
+    #[test]
+    fn ffa_get_bst_relays_requested_battery_id_and_preserves_response() {
+        let bst = canned_bst();
+        let relay = relay_primed_with_bst(bst);
+        let mut svc = Battery::new(&relay);
+
+        let battery_id = 0x03;
+        let response = svc
+            .ffa_msg_send_direct_req2(make_ffa_request(BATTERY_CMD_GET_BST as u8, battery_id))
+            .expect("valid GetBst returns DIRECT_RESP2");
+
+        let inner_tx = strip_mctp_framing(&relay.borrow().transport().tx);
+        assert_eq!(
+            inner_tx,
+            std::vec![0x02, 0x08, 0x00, 0x02, battery_id],
+            "requested battery_id must appear as the last EC request byte"
+        );
+
+        assert_eq!(response.payload().u32_at(0), bst.battery_state.bits());
+        assert_eq!(response.payload().u32_at(4), bst.battery_present_rate);
+        assert_eq!(response.payload().u32_at(8), bst.battery_remaining_capacity);
+        assert_eq!(response.payload().u32_at(12), bst.battery_present_voltage);
+    }
+
+    #[test]
+    fn ffa_unknown_opcode_is_rejected_without_relaying() {
+        let relay = RefCell::new(EcRelay::new(LoopbackTransport::new()));
+        let mut svc = Battery::new(&relay);
+
+        let result = svc.ffa_msg_send_direct_req2(make_ffa_request(0xFF, 0x00));
+
+        assert_eq!(result, Err(FfaError::Other("Unknown Battery Command")));
+        assert!(
+            relay.borrow().transport().tx.is_empty(),
+            "unknown opcode must be rejected before any relay I/O"
+        );
     }
 }
