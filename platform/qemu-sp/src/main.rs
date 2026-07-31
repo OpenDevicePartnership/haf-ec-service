@@ -38,6 +38,7 @@ fn main() -> ! {
 
     MessageHandler::new()
         .append(Thermal::new(&relay))
+        .append(ec_service_lib::services::Ucsi::new())
         .append(ec_service_lib::services::FwMgmt::new())
         .append(ec_service_lib::services::Notify::new())
         .append(battery::Battery::new())
