@@ -113,11 +113,11 @@ extern crate std;
 mod tests {
     use super::*;
 
-    use embedded_usb_pd::ucsi::cci::LocalCci;
-    use embedded_usb_pd::ucsi::lpm::get_connector_capability as gcc;
-    use embedded_usb_pd::ucsi::lpm::get_connector_status as gcs;
-    use embedded_usb_pd::ucsi::ppm::get_capability as gcap;
-    use embedded_usb_pd::ucsi::{lpm, ppm, ResponseData};
+    use embedded_usb_pd::ucsi::v1_2::cci::LocalCci;
+    use embedded_usb_pd::ucsi::v1_2::lpm::get_connector_capability as gcc;
+    use embedded_usb_pd::ucsi::v1_2::lpm::get_connector_status as gcs;
+    use embedded_usb_pd::ucsi::v1_2::ppm::get_capability as gcap;
+    use embedded_usb_pd::ucsi::v1_2::{lpm, ppm, ResponseData};
     use embedded_usb_pd::PowerRole;
 
     const DOORBELL: u8 = 0x00;
