@@ -38,6 +38,9 @@ battery-service-interface.workspace = true
 thermal-service-relay.workspace = true
 time-alarm-service-relay.workspace = true
 time-alarm-service-interface.workspace = true
+# Independent UCSI wire-format oracle — used only by host `#[cfg(test)]` gate
+# tests in services/ucsi.rs. Never a runtime dep (the SP hand-encodes bytes).
+embedded-usb-pd.workspace = true
 
 [features]
 default = []

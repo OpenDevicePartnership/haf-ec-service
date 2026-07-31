@@ -12,6 +12,7 @@ mod time_alarm;
 mod tpm;
 mod tpm_sst;
 mod tpm_stub;
+mod ucsi;
 
 pub use battery::Battery;
 pub use ec_relay::{EcRelay, MctpSerialTransport, OdpTransport, Relay};
@@ -22,6 +23,7 @@ pub use time_alarm::TimeAlarm;
 pub use tpm::TpmService;
 pub use tpm_sst::TpmSst;
 pub use tpm_stub::TpmServiceStub;
+pub use ucsi::Ucsi;
 
 /// Borrow a typed request from an FFA payload after its command byte.
 fn parse_ffa_request<T>(payload: &DirectMessagePayload) -> Option<&T>
