@@ -42,6 +42,8 @@ battery-service-interface = { git = "https://github.com/OpenDevicePartnership/em
 thermal-service-relay = { git = "https://github.com/OpenDevicePartnership/embedded-services.git", rev = "0cadc205b55fe829df3c8cb3accb5cc565422ccc", default-features = false }
 time-alarm-service-relay = { git = "https://github.com/OpenDevicePartnership/embedded-services.git", rev = "0cadc205b55fe829df3c8cb3accb5cc565422ccc", default-features = false }
 time-alarm-service-interface = { git = "https://github.com/OpenDevicePartnership/embedded-services.git", rev = "0cadc205b55fe829df3c8cb3accb5cc565422ccc", default-features = false }
+# Host-test-only wire-format oracle for the UCSI stub (see ec-service-lib/src/services/ucsi.rs).
+embedded-usb-pd = { git = "https://github.com/OpenDevicePartnership/embedded-usb-pd", rev = "bc8c582395ee4861be95110d4097a0b39de01717", default-features = false, features = ["ucsi-v1_2"] }
 embedded-io = { version = "0.7", default-features = false }
 log = { version = "0.4", default-features = false }
 mockall = "0.13.1"
