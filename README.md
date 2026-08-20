@@ -5,6 +5,11 @@
 This is a sample implementation of the EC service which runs under a dedicated secure partition in Hafnium.
 It is written in Rust and has dependencies on FF-A, MU UEFI, Hafnium and TFA.
 
+## Documentation
+
+Project documentation is maintained in the [mdBook source](docs/src/SUMMARY.md)
+and published through GitHub Pages.
+
 ## Feature Status
 
 The following components are available within this crate:
