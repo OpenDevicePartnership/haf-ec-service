@@ -16,16 +16,28 @@ const INVALID_TIMESTAMP: [u8; ACPI_TIMESTAMP_LEN] = [0u8; ACPI_TIMESTAMP_LEN];
 #[derive(Debug, Clone, Copy, PartialEq, Eq, num_enum::TryFromPrimitive, num_enum::IntoPrimitive)]
 #[repr(u16)]
 pub enum TimeAlarmCommand {
+    GetCapabilities = 1,
     GetRealTime = 2,
+    GetWakeStatus = 4,
     SetTimerValue = 6,
     GetTimerValue = 7,
+    GetExpiredTimerPolicy = 9,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, num_enum::IntoPrimitive)]
 #[repr(u16)]
 enum TimeAlarmResponseDiscriminant {
+    Capabilities = 1,
+    TimerStatus = 3,
+    WakePolicy = 4,
     TimerSeconds = 5,
     OkNoData = 6,
+}
+
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct GetWakeStatusRequest {
+    timer_id: U32,
 }
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
@@ -38,6 +50,12 @@ struct SetTimerValueRequest {
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
 struct GetTimerValueRequest {
+    timer_id: U32,
+}
+
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct GetExpiredTimerPolicyRequest {
     timer_id: U32,
 }
 
@@ -91,6 +109,32 @@ impl<'r, R: Relay> TimeAlarm<'r, R> {
             .map_err(TimeAlarmError::Relay)
     }
 
+    fn get_capabilities(&self) -> core::result::Result<u32, TimeAlarmError> {
+        self.relay
+            .borrow_mut()
+            .invoke_request_with_response_id(
+                TIME_ALARM_SERVICE_ID,
+                TimeAlarmCommand::GetCapabilities.into(),
+                TimeAlarmResponseDiscriminant::Capabilities.into(),
+                &[],
+                |body| take_exact_array::<4>(body).map(u32::from_le_bytes),
+            )
+            .map_err(TimeAlarmError::Relay)
+    }
+
+    fn get_wake_status(&self, request: &GetWakeStatusRequest) -> core::result::Result<u32, TimeAlarmError> {
+        self.relay
+            .borrow_mut()
+            .invoke_request_with_response_id(
+                TIME_ALARM_SERVICE_ID,
+                TimeAlarmCommand::GetWakeStatus.into(),
+                TimeAlarmResponseDiscriminant::TimerStatus.into(),
+                request.as_bytes(),
+                |body| take_exact_array::<4>(body).map(u32::from_le_bytes),
+            )
+            .map_err(TimeAlarmError::Relay)
+    }
+
     fn set_timer_value(&self, request: &SetTimerValueRequest) -> core::result::Result<(), TimeAlarmError> {
         self.relay
             .borrow_mut()
@@ -119,6 +163,22 @@ impl<'r, R: Relay> TimeAlarm<'r, R> {
             )
             .map_err(TimeAlarmError::Relay)
     }
+
+    fn get_expired_timer_policy(
+        &self,
+        request: &GetExpiredTimerPolicyRequest,
+    ) -> core::result::Result<u32, TimeAlarmError> {
+        self.relay
+            .borrow_mut()
+            .invoke_request_with_response_id(
+                TIME_ALARM_SERVICE_ID,
+                TimeAlarmCommand::GetExpiredTimerPolicy.into(),
+                TimeAlarmResponseDiscriminant::WakePolicy.into(),
+                request.as_bytes(),
+                |body| take_exact_array::<4>(body).map(u32::from_le_bytes),
+            )
+            .map_err(TimeAlarmError::Relay)
+    }
 }
 
 impl<R: Relay> Service for TimeAlarm<'_, R> {
@@ -130,12 +190,22 @@ impl<R: Relay> Service for TimeAlarm<'_, R> {
             .map_err(|_| FfaError::Other("Unknown TimeAlarm Command"))?;
 
         match command {
+            TimeAlarmCommand::GetCapabilities => {
+                let value = self.get_capabilities().unwrap_or(LOCAL_ERROR_SENTINEL);
+                Ok(MsgSendDirectResp2::from_req_with_payload(&msg, scalar_payload(value)))
+            }
             TimeAlarmCommand::GetRealTime => {
                 let timestamp = self.get_real_time().unwrap_or(INVALID_TIMESTAMP);
                 Ok(MsgSendDirectResp2::from_req_with_payload(
                     &msg,
                     DirectMessagePayload::from_iter(timestamp),
                 ))
+            }
+            TimeAlarmCommand::GetWakeStatus => {
+                let value = parse_ffa_request::<GetWakeStatusRequest>(msg.payload())
+                    .map(|request| self.get_wake_status(request).unwrap_or(LOCAL_ERROR_SENTINEL))
+                    .unwrap_or(LOCAL_ERROR_SENTINEL);
+                Ok(MsgSendDirectResp2::from_req_with_payload(&msg, scalar_payload(value)))
             }
             TimeAlarmCommand::SetTimerValue => {
                 let status = parse_ffa_request::<SetTimerValueRequest>(msg.payload())
@@ -146,6 +216,12 @@ impl<R: Relay> Service for TimeAlarm<'_, R> {
             TimeAlarmCommand::GetTimerValue => {
                 let value = parse_ffa_request::<GetTimerValueRequest>(msg.payload())
                     .map(|request| self.get_timer_value(request).unwrap_or(LOCAL_ERROR_SENTINEL))
+                    .unwrap_or(LOCAL_ERROR_SENTINEL);
+                Ok(MsgSendDirectResp2::from_req_with_payload(&msg, scalar_payload(value)))
+            }
+            TimeAlarmCommand::GetExpiredTimerPolicy => {
+                let value = parse_ffa_request::<GetExpiredTimerPolicyRequest>(msg.payload())
+                    .map(|request| self.get_expired_timer_policy(request).unwrap_or(LOCAL_ERROR_SENTINEL))
                     .unwrap_or(LOCAL_ERROR_SENTINEL);
                 Ok(MsgSendDirectResp2::from_req_with_payload(&msg, scalar_payload(value)))
             }
@@ -162,7 +238,9 @@ mod tests {
     use crate::services::ec_relay::test_util::{frame_response_packets, strip_mctp_framing, LoopbackTransport};
     use crate::services::ec_relay::{self, EcRelay};
     use embedded_services::relay::SerializableMessage;
-    use time_alarm_service_interface::{AcpiTimerId, AcpiTimestamp, AlarmTimerSeconds};
+    use time_alarm_service_interface::{
+        AcpiTimerId, AcpiTimestamp, AlarmExpiredWakePolicy, AlarmTimerSeconds, TimeAlarmDeviceCapabilities, TimerStatus,
+    };
     use time_alarm_service_relay::{AcpiTimeAlarmRequest, AcpiTimeAlarmResponse};
 
     const RAW_TIMESTAMP: [u8; ACPI_TIMESTAMP_LEN] = [
@@ -255,6 +333,81 @@ mod tests {
         assert_eq!(service_id, TIME_ALARM_SERVICE_ID);
         let decoded = AcpiTimeAlarmRequest::deserialize(message_id, &inner[4..]).expect("EC decoder accepts request");
         assert!(matches!(decoded, AcpiTimeAlarmRequest::GetRealTime));
+    }
+
+    #[test]
+    fn get_capabilities_uses_canonical_wire_contract() {
+        let capabilities = TimeAlarmDeviceCapabilities(0x1F7);
+        let (header, body) = serialized_response::<4>(AcpiTimeAlarmResponse::Capabilities(capabilities));
+        let relay = relay_with_response(header, &body);
+        let mut svc = TimeAlarm::new(&relay);
+
+        let response = svc
+            .ffa_msg_send_direct_req2(make_ffa_request(
+                u16::from(TimeAlarmCommand::GetCapabilities) as u8,
+                &[],
+            ))
+            .expect("GetCapabilities returns DIRECT_RESP2");
+
+        assert_eq!(response.payload().u32_at(0), capabilities.0);
+        let inner = transmitted_inner(&relay);
+        assert_eq!(inner, std::vec![0x02, 0x0B, 0x00, 0x01]);
+        assert_eq!(
+            AcpiTimeAlarmRequest::deserialize(1, &inner[4..]).expect("EC decoder accepts GetCapabilities"),
+            AcpiTimeAlarmRequest::GetCapabilities,
+        );
+    }
+
+    #[test]
+    fn get_wake_status_uses_canonical_wire_contract() {
+        let status = TimerStatus(0x03);
+        let (header, body) = serialized_response::<4>(AcpiTimeAlarmResponse::TimerStatus(status));
+        let relay = relay_with_response(header, &body);
+        let mut svc = TimeAlarm::new(&relay);
+        let timer_id = u32::from(AcpiTimerId::DcPower).to_le_bytes();
+
+        let response = svc
+            .ffa_msg_send_direct_req2(make_ffa_request(
+                u16::from(TimeAlarmCommand::GetWakeStatus) as u8,
+                &timer_id,
+            ))
+            .expect("GetWakeStatus returns DIRECT_RESP2");
+
+        assert_eq!(response.payload().u32_at(0), status.0);
+        let inner = transmitted_inner(&relay);
+        let mut expected = std::vec![0x02, 0x0B, 0x00, 0x04];
+        expected.extend_from_slice(&timer_id);
+        assert_eq!(inner, expected);
+        assert_eq!(
+            AcpiTimeAlarmRequest::deserialize(4, &inner[4..]).expect("EC decoder accepts GetWakeStatus"),
+            AcpiTimeAlarmRequest::GetWakeStatus(AcpiTimerId::DcPower),
+        );
+    }
+
+    #[test]
+    fn get_expired_timer_policy_uses_canonical_wire_contract() {
+        let policy = AlarmExpiredWakePolicy(45);
+        let (header, body) = serialized_response::<4>(AcpiTimeAlarmResponse::WakePolicy(policy));
+        let relay = relay_with_response(header, &body);
+        let mut svc = TimeAlarm::new(&relay);
+        let timer_id = u32::from(AcpiTimerId::AcPower).to_le_bytes();
+
+        let response = svc
+            .ffa_msg_send_direct_req2(make_ffa_request(
+                u16::from(TimeAlarmCommand::GetExpiredTimerPolicy) as u8,
+                &timer_id,
+            ))
+            .expect("GetExpiredTimerPolicy returns DIRECT_RESP2");
+
+        assert_eq!(response.payload().u32_at(0), policy.0);
+        let inner = transmitted_inner(&relay);
+        let mut expected = std::vec![0x02, 0x0B, 0x00, 0x09];
+        expected.extend_from_slice(&timer_id);
+        assert_eq!(inner, expected);
+        assert_eq!(
+            AcpiTimeAlarmRequest::deserialize(9, &inner[4..]).expect("EC decoder accepts GetExpiredTimerPolicy"),
+            AcpiTimeAlarmRequest::GetExpiredTimerPolicy(AcpiTimerId::AcPower),
+        );
     }
 
     #[test]
