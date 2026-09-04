@@ -435,7 +435,7 @@ impl<T: OdpTransport> Relay for EcRelay<T> {
         }
 
         // ----- 2. Read one framed packet back into a small RX buffer.
-        let mut rx_packet = [0u8; 64];
+        let mut rx_packet = [0u8; 256];
         let rx_len = self.transport.recv_framed_packet(&mut rx_packet)?;
 
         // ----- 3. MCTP-strip via a fresh PacketContext borrowing
