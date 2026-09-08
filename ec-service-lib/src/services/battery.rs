@@ -1,5 +1,5 @@
-//! `Battery` — FFA service that proxies Normal-World `GetBst` requests
-//! to the EC's `BatteryServiceRelayHandler` over MCTP.
+//! `Battery` — FFA service that proxies Normal-World `GetBix`, `GetBst`,
+//! and `SetBtp` requests to the EC over MCTP.
 //!
 //! Transport-agnostic via the [`crate::services::ec_relay::Relay`] trait.
 //! [`Battery`] is generic over `R: Relay`; the concrete relay impl
@@ -25,6 +25,10 @@
 //! `battery_present_rate`, `battery_remaining_capacity`,
 //! `battery_present_voltage`).
 //!
+//! `GetBix` uses the same 1-byte request body and returns the canonical
+//! 100-byte BIX body. `SetBtp` sends the battery id followed by one LE
+//! `u32` trip point and receives an empty success body.
+//!
 //! # SP-side runtime serialization is manual
 //!
 //! `embedded_services::relay::SerializableMessage` does not compile for
@@ -34,13 +38,14 @@
 //! MANUALLY (1-byte request payload; 4 LE u32 dwords for the response
 //! body). The wire-format gate test in the `tests` module below
 //! round-trips bytes through the EC's OWN `SerializableMessage` impl
-//! (via `[dev-dependencies]`) so any drift fails the build.
+//! (via `[dev-dependencies]`) so any drift fails the build. `GetBix` and
+//! `SetBtp` use the same manual runtime serialization strategy.
 
 use core::cell::RefCell;
 
 use uuid::{uuid, Uuid};
 
-use crate::services::ec_relay::{take_array, EcRelayError, Relay};
+use crate::services::ec_relay::{take_array, take_exact_array, EcRelayError, Relay};
 use crate::{Result, Service};
 use odp_ffa::{Error as FfaError, HasRegisterPayload, MsgSendDirectReq2, MsgSendDirectResp2};
 
@@ -49,9 +54,15 @@ use odp_ffa::{Error as FfaError, HasRegisterPayload, MsgSendDirectReq2, MsgSendD
 /// `OpenDevicePartnership/odp-embedded-controller::platform/platform-common/src/lib.rs:9`).
 pub const BATTERY_SERVICE_ID: u8 = 0x08;
 
-/// `BatteryCmd::GetBst` discriminant from
-/// `embedded-services/battery-service-relay/src/serialization.rs`.
-pub const BATTERY_CMD_GET_BST: u16 = 2;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, num_enum::TryFromPrimitive, num_enum::IntoPrimitive)]
+#[repr(u16)]
+pub enum BatteryCommand {
+    GetBix = 1,
+    GetBst = 2,
+    SetBtp = 6,
+}
+
+const BIX_RESPONSE_LEN: usize = 100;
 
 /// Parsed `GetBst` response (mirrors
 /// `battery_service_interface::BstReturn` field-for-field but stays
@@ -109,17 +120,46 @@ impl<'r, R: Relay> Battery<'r, R> {
     pub fn get_bst(&self, battery_id: u8) -> core::result::Result<BstReturnRaw, BatteryError> {
         self.relay
             .borrow_mut()
-            .invoke_request(BATTERY_SERVICE_ID, BATTERY_CMD_GET_BST, &[battery_id], |body| {
-                let (state, body) = take_array(body)?;
-                let (rate, body) = take_array(body)?;
-                let (capacity, body) = take_array(body)?;
-                let (voltage, _) = take_array(body)?;
-                Ok(BstReturnRaw {
-                    battery_state: u32::from_le_bytes(state),
-                    battery_present_rate: u32::from_le_bytes(rate),
-                    battery_remaining_capacity: u32::from_le_bytes(capacity),
-                    battery_present_voltage: u32::from_le_bytes(voltage),
-                })
+            .invoke_request(
+                BATTERY_SERVICE_ID,
+                BatteryCommand::GetBst.into(),
+                &[battery_id],
+                |body| {
+                    let (state, body) = take_array(body)?;
+                    let (rate, body) = take_array(body)?;
+                    let (capacity, body) = take_array(body)?;
+                    let (voltage, _) = take_array(body)?;
+                    Ok(BstReturnRaw {
+                        battery_state: u32::from_le_bytes(state),
+                        battery_present_rate: u32::from_le_bytes(rate),
+                        battery_remaining_capacity: u32::from_le_bytes(capacity),
+                        battery_present_voltage: u32::from_le_bytes(voltage),
+                    })
+                },
+            )
+            .map_err(BatteryError::Relay)
+    }
+
+    pub fn get_bix(&self, battery_id: u8) -> core::result::Result<[u8; BIX_RESPONSE_LEN], BatteryError> {
+        self.relay
+            .borrow_mut()
+            .invoke_request(
+                BATTERY_SERVICE_ID,
+                BatteryCommand::GetBix.into(),
+                &[battery_id],
+                take_exact_array::<BIX_RESPONSE_LEN>,
+            )
+            .map_err(BatteryError::Relay)
+    }
+
+    pub fn set_btp(&self, battery_id: u8, trip_point: u32) -> core::result::Result<(), BatteryError> {
+        let mut request = [0u8; 5];
+        request[0] = battery_id;
+        request[1..].copy_from_slice(&trip_point.to_le_bytes());
+        self.relay
+            .borrow_mut()
+            .invoke_request(BATTERY_SERVICE_ID, BatteryCommand::SetBtp.into(), &request, |body| {
+                take_exact_array::<0>(body).map(|_| ())
             })
             .map_err(BatteryError::Relay)
     }
@@ -130,29 +170,45 @@ impl<R: Relay> Service for Battery<'_, R> {
     const NAME: &'static str = "Battery";
 
     fn ffa_msg_send_direct_req2(&mut self, msg: MsgSendDirectReq2) -> Result<MsgSendDirectResp2> {
-        if msg.payload().u8_at(0) as u16 != BATTERY_CMD_GET_BST {
-            return Err(FfaError::Other("Unknown Battery Command"));
-        }
+        let command = BatteryCommand::try_from(msg.payload().u8_at(0) as u16)
+            .map_err(|_| FfaError::Other("Unknown Battery Command"))?;
         let battery_id = msg.payload().u8_at(1);
-        match self.get_bst(battery_id) {
-            Ok(bst) => {
-                // Pack the 16 BST bytes as 4 LE u32 dwords across the
-                // direct-message register payload (mirrors notify.rs's
-                // `From<NfyGenericRsp>` pattern of placing scalar
-                // values at the start of the payload).
-                let payload = odp_ffa::DirectMessagePayload::from_iter(
-                    bst.battery_state
-                        .to_le_bytes()
-                        .into_iter()
-                        .chain(bst.battery_present_rate.to_le_bytes())
-                        .chain(bst.battery_remaining_capacity.to_le_bytes())
-                        .chain(bst.battery_present_voltage.to_le_bytes()),
-                );
+        match command {
+            BatteryCommand::GetBst => match self.get_bst(battery_id) {
+                Ok(bst) => {
+                    // Pack the 16 BST bytes as 4 LE u32 dwords across the
+                    // direct-message register payload (mirrors notify.rs's
+                    // `From<NfyGenericRsp>` pattern of placing scalar
+                    // values at the start of the payload).
+                    let payload = odp_ffa::DirectMessagePayload::from_iter(
+                        bst.battery_state
+                            .to_le_bytes()
+                            .into_iter()
+                            .chain(bst.battery_present_rate.to_le_bytes())
+                            .chain(bst.battery_remaining_capacity.to_le_bytes())
+                            .chain(bst.battery_present_voltage.to_le_bytes()),
+                    );
+                    Ok(MsgSendDirectResp2::from_req_with_payload(&msg, payload))
+                }
+                Err(_) => Err(FfaError::Other(
+                    "Battery: GetBst round-trip failed (transport or wire decode)",
+                )),
+            },
+            BatteryCommand::GetBix => {
+                let payload =
+                    odp_ffa::DirectMessagePayload::from_iter(self.get_bix(battery_id).map_err(|_| {
+                        FfaError::Other("Battery: GetBix round-trip failed (transport or wire decode)")
+                    })?);
                 Ok(MsgSendDirectResp2::from_req_with_payload(&msg, payload))
             }
-            Err(_) => Err(FfaError::Other(
-                "Battery: GetBst round-trip failed (transport or wire decode)",
-            )),
+            BatteryCommand::SetBtp => {
+                self.set_btp(battery_id, msg.payload().u32_at(4))
+                    .map_err(|_| FfaError::Other("Battery: SetBtp round-trip failed (transport or wire decode)"))?;
+                Ok(MsgSendDirectResp2::from_req_with_payload(
+                    &msg,
+                    odp_ffa::DirectMessagePayload::from_iter(core::iter::empty()),
+                ))
+            }
         }
     }
 }
@@ -198,7 +254,7 @@ mod tests {
             .expect("ec-side serialize");
         assert_eq!(n, 16, "GetBst response body must be 16 bytes");
 
-        let response_header = ec_relay::build_odp_header(false, BATTERY_SERVICE_ID, BATTERY_CMD_GET_BST);
+        let response_header = ec_relay::build_odp_header(false, BATTERY_SERVICE_ID, BatteryCommand::GetBst.into());
         let framed_response = frame_response_packets(response_header, &response_payload);
 
         // -- Construct the shared EcRelay (wrapping a loopback transport)
@@ -228,7 +284,7 @@ mod tests {
         let (is_req, svc_id, _is_err, msg_id) = ec_relay::parse_odp_header(&inner_tx[..4]).expect("parse header");
         assert!(is_req, "must be a request");
         assert_eq!(svc_id, BATTERY_SERVICE_ID);
-        assert_eq!(msg_id, BATTERY_CMD_GET_BST);
+        assert_eq!(msg_id, u16::from(BatteryCommand::GetBst));
         let decoded = AcpiBatteryRequest::deserialize(msg_id, &inner_tx[4..])
             .expect("ec-side decoder must accept SP-produced bytes");
         assert!(
@@ -244,13 +300,9 @@ mod tests {
         assert_eq!(result.battery_present_voltage, bst.battery_present_voltage);
     }
 
-    fn relay_primed_with_bst(bst: BstReturn) -> RefCell<EcRelay<LoopbackTransport>> {
-        let mut response_payload = [0u8; 16];
-        AcpiBatteryResponse::GetBst { bst }
-            .serialize(&mut response_payload)
-            .expect("ec-side serialize");
-        let header = ec_relay::build_odp_header(false, BATTERY_SERVICE_ID, BATTERY_CMD_GET_BST);
-        let framed = frame_response_packets(header, &response_payload);
+    fn relay_primed_with_response(command: BatteryCommand, body: &[u8]) -> RefCell<EcRelay<LoopbackTransport>> {
+        let header = ec_relay::build_odp_header(false, BATTERY_SERVICE_ID, command.into());
+        let framed = frame_response_packets(header, body);
         let mut transport = LoopbackTransport::new();
         transport.prime_rx(framed.iter().copied());
         RefCell::new(EcRelay::new(transport))
@@ -268,12 +320,16 @@ mod tests {
     #[test]
     fn ffa_get_bst_relays_requested_battery_id_and_preserves_response() {
         let bst = canned_bst();
-        let relay = relay_primed_with_bst(bst);
+        let mut body = [0u8; 16];
+        AcpiBatteryResponse::GetBst { bst }
+            .serialize(&mut body)
+            .expect("EC-side GetBst serialize");
+        let relay = relay_primed_with_response(BatteryCommand::GetBst, &body);
         let mut svc = Battery::new(&relay);
 
         let battery_id = 0x03;
         let response = svc
-            .ffa_msg_send_direct_req2(make_ffa_request(BATTERY_CMD_GET_BST as u8, battery_id))
+            .ffa_msg_send_direct_req2(make_ffa_request(u16::from(BatteryCommand::GetBst) as u8, battery_id))
             .expect("valid GetBst returns DIRECT_RESP2");
 
         let inner_tx = strip_mctp_framing(&relay.borrow().transport().tx);
@@ -301,5 +357,62 @@ mod tests {
             relay.borrow().transport().tx.is_empty(),
             "unknown opcode must be rejected before any relay I/O"
         );
+    }
+
+    #[test]
+    fn ffa_get_bix_preserves_canonical_full_response() {
+        let mut body = [0u8; BIX_RESPONSE_LEN];
+        let written = AcpiBatteryResponse::GetBix {
+            bix: battery_service_interface::BixFixedStrings::default(),
+        }
+        .serialize(&mut body)
+        .expect("EC-side GetBix serialize");
+        assert_eq!(written, BIX_RESPONSE_LEN);
+
+        let relay = relay_primed_with_response(BatteryCommand::GetBix, &body);
+        let mut svc = Battery::new(&relay);
+        let response = svc
+            .ffa_msg_send_direct_req2(make_ffa_request(u16::from(BatteryCommand::GetBix) as u8, 0))
+            .expect("GetBix returns DIRECT_RESP2");
+
+        assert_eq!(response.payload().slice(0..BIX_RESPONSE_LEN), &body);
+        assert!(response
+            .payload()
+            .u8_iter()
+            .skip(BIX_RESPONSE_LEN)
+            .all(|byte| byte == 0));
+    }
+
+    #[test]
+    fn ffa_set_btp_compacts_aml_padding_to_canonical_ec_request() {
+        let battery_id = 3;
+        let trip_point = 0x1122_3344u32;
+        let mut args = [0u8; 7];
+        args[0] = battery_id;
+        args[3..].copy_from_slice(&trip_point.to_le_bytes());
+        let relay = relay_primed_with_response(BatteryCommand::SetBtp, &[]);
+        let mut svc = Battery::new(&relay);
+
+        let response = svc
+            .ffa_msg_send_direct_req2(MsgSendDirectReq2::new(
+                0x0001,
+                0x8001,
+                Battery::<EcRelay<LoopbackTransport>>::UUID,
+                DirectMessagePayload::from_iter(
+                    core::iter::once(u16::from(BatteryCommand::SetBtp) as u8).chain(args.iter().copied()),
+                ),
+            ))
+            .expect("SetBtp returns DIRECT_RESP2");
+
+        assert_eq!(response.payload().u32_at(0), 0);
+        let inner = strip_mctp_framing(&relay.borrow().transport().tx);
+        let mut expected = ec_relay::build_odp_header(true, BATTERY_SERVICE_ID, BatteryCommand::SetBtp.into()).to_vec();
+        expected.push(battery_id);
+        expected.extend_from_slice(&trip_point.to_le_bytes());
+        assert_eq!(inner, expected);
+        assert!(matches!(
+            AcpiBatteryRequest::deserialize(BatteryCommand::SetBtp.into(), &inner[4..]),
+            Ok(AcpiBatteryRequest::SetBtp { battery_id: 3, btp }) if btp.trip_point == trip_point
+        ));
     }
 }
