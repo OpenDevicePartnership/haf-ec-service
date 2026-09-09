@@ -35,6 +35,9 @@ embedded-services.workspace = true
 battery-service-relay.workspace = true
 battery-service-interface.workspace = true
 
+[target.'cfg(not(target_os = "none"))'.dev-dependencies]
+critical-section = { workspace = true, features = ["std"] }
+
 [features]
 default = []
 test-bypass-locality-check = []
