@@ -8,11 +8,22 @@ use uuid::{uuid, Uuid};
 const NOTIFY_MAX_SERVICES: usize = 16;
 const NOTIFY_MAX_MAPPINGS: usize = 64;
 
-// Maximum number of mappings that can be registered in a single request, as restricted
-// by the number of registers available.
-const NOTIFY_MAX_MAPPINGS_PER_REQ: usize = 8;
+// Maximum number of notification tuples that fit in a single request,
+// bounded by the available payload registers (x7..x13).
+const NOTIFY_MAX_TUPLES_PER_REQ: usize = 7;
 
 const MESSAGE_INFO_DIR_RESP: u64 = 0x100; // Base for direct response messages
+
+// Notify request wire layout (FF-A direct-request payload registers).
+const NOTIFY_COUNT_REG: usize = 6; // x6: tuple count (lower 9 bits)
+const NOTIFY_TUPLE_BASE_REG: usize = 7; // x7..: one register per tuple
+const NOTIFY_COUNT_MASK: u64 = 0x1ff;
+
+// Per-tuple bit layout within a register.
+const NOTIFY_COOKIE_SHIFT: u64 = 32;
+const NOTIFY_ID_SHIFT: u64 = 23;
+const NOTIFY_ID_MASK: u64 = 0x1ff;
+const NOTIFY_TYPE_PER_VCPU_BIT: u64 = 0x1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, num_enum::TryFromPrimitive, num_enum::IntoPrimitive)]
 #[repr(u8)]
@@ -53,16 +64,17 @@ struct NotifyReq {
     receiver_uuid: Uuid,
     msg_info: MessageInfo,
     count: u8,
-    notifications: [(u32, u16, NotifyType); 7], // Cookie, Notification ID, Type
+    notifications: [(u32, u16, NotifyType); NOTIFY_MAX_TUPLES_PER_REQ], // Cookie, Notification ID, Type
 }
 
 impl NotifyReq {
     fn extract_tuple(value: u64) -> (u32, u16, NotifyType) {
-        let cookie = (value >> 32) as u32;
-        let id = ((value >> 23) & 0x1FF) as u16;
-        let ntype = match (value & 0x1) != 0 {
-            false => NotifyType::Global,
-            true => NotifyType::PerVcpu,
+        let cookie = (value >> NOTIFY_COOKIE_SHIFT) as u32;
+        let id = ((value >> NOTIFY_ID_SHIFT) & NOTIFY_ID_MASK) as u16;
+        let ntype = if value & NOTIFY_TYPE_PER_VCPU_BIT != 0 {
+            NotifyType::PerVcpu
+        } else {
+            NotifyType::Global
         };
         (cookie, id, ntype)
     }
@@ -77,10 +89,11 @@ impl From<MsgSendDirectReq2> for NotifyReq {
         let receiver_uuid =
             Uuid::from_u128_le(((payload.register_at(4) as u128) << 64) | (payload.register_at(3) as u128));
         let msg_info = MessageInfo::from_raw(payload.register_at(5));
-        let count = (payload.register_at(6) & 0x1ff).min(7) as u8; // Count is lower 9 bits
-        let mut notifications = [(0, 0, NotifyType::Global); 7];
+        let count =
+            (payload.register_at(NOTIFY_COUNT_REG) & NOTIFY_COUNT_MASK).min(NOTIFY_MAX_TUPLES_PER_REQ as u64) as u8;
+        let mut notifications = [(0, 0, NotifyType::Global); NOTIFY_MAX_TUPLES_PER_REQ];
         for (i, notif) in notifications.iter_mut().enumerate().take(count as usize) {
-            *notif = NotifyReq::extract_tuple(payload.register_at(7 + i));
+            *notif = NotifyReq::extract_tuple(payload.register_at(NOTIFY_TUPLE_BASE_REG + i));
         }
 
         NotifyReq {
@@ -119,13 +132,27 @@ impl From<NfySetupRsp> for DirectMessagePayload {
     }
 }
 
+impl NfySetupRsp {
+    // Builds the direct response for `req` carrying `status`, tagged with the
+    // handler's message id. Collapses the otherwise-repeated 5-field literal.
+    fn respond(msg_id: MessageID, req: &NotifyReq, status: ErrorCode) -> Self {
+        Self {
+            reserved: 0,
+            sender_uuid: req.sender_uuid,
+            receiver_uuid: req.receiver_uuid,
+            msg_info: MESSAGE_INFO_DIR_RESP + msg_id as u64,
+            status,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MessageInfo(u64);
 
 impl MessageInfo {
-    /// Get the message ID (bits 0–2).
-    fn message_id(&self) -> MessageID {
-        ((self.0 & 0b111) as u8).try_into().expect("Invalid Message ID")
+    /// Get the message ID (bits 0–2). Returns None for invalid bit patterns.
+    fn message_id(&self) -> Option<MessageID> {
+        ((self.0 & 0b111) as u8).try_into().ok()
     }
 
     /// Construct from a raw u64.
@@ -137,10 +164,19 @@ impl MessageInfo {
 #[derive(Default, Debug, Copy, Clone)]
 struct NfyMapping {
     cookie: u32,       // Cookie for the notification
-    id: u16,           // Global bitmask value
+    id: u16,           // Global bitmask value (must be < 64 for u64 bitmap)
     ntype: NotifyType, // Type of notification (Global or PerVcpu)
     src_id: u16,       // Source ID for the notification
     in_use: bool,      // Whether the notification mapping is currently in use
+}
+
+/// Safely compute a bitmask for a notification ID, returning None if id >= 64.
+fn nfy_bitmask(id: u16) -> Option<u64> {
+    if id < 64 {
+        Some(1u64 << id)
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -186,6 +222,22 @@ impl Notify {
         self.entries.iter().position(|entry| !entry.in_use)
     }
 
+    // Returns the entry index for `uuid`, allocating and initializing a fresh
+    // entry slot if the service is not yet registered. None only when every
+    // entry slot is already in use.
+    fn find_or_create_entry(&mut self, uuid: Uuid) -> Option<usize> {
+        if let Some(index) = self.nfy_find_entry(uuid) {
+            return Some(index);
+        }
+        let empty = self.nfy_find_empty_slot()?;
+        self.entries[empty] = NfyEntry {
+            service_uuid: uuid,
+            in_use: true,
+            mappings: [NfyMapping::default(); NOTIFY_MAX_MAPPINGS],
+        };
+        Some(empty)
+    }
+
     fn nfy_find_matching_cookie(&self, entry_index: usize, cookie: u32) -> Option<usize> {
         if entry_index >= NOTIFY_MAX_SERVICES {
             return None;
@@ -211,43 +263,35 @@ impl Notify {
 
         // loop through the mappings in the req and register them
         // We will iterate through the notifications, with a maximum of req.count
-        for (cookie, id, ntype) in req.notifications.iter().take(req.count as usize) {
-            let mut applied = false;
-            if let Some(_mapping_index) = self.nfy_find_matching_cookie(entry_index, *cookie) {
-                // If we found a matching cookie, this does not make sense, so we return an error
+        for &(cookie, id, ntype) in req.notifications.iter().take(req.count as usize) {
+            if self.nfy_find_matching_cookie(entry_index, cookie).is_some() {
+                // A matching cookie already exists, which is a conflict.
                 error!("Found matching cookie for entry {entry_index}: {cookie}");
                 return ErrorCode::InvalidParameters;
-            } else if temp_bitmask & (1 << id) != 0 {
-                // If the bit is already set, we cannot register this mapping
+            }
+
+            let Some(bit) = nfy_bitmask(id) else {
+                error!("Notification id out of range for entry {entry_index}: {id}");
+                return ErrorCode::InvalidParameters;
+            };
+            if temp_bitmask & bit != 0 {
                 error!("Bitmask already set for entry {entry_index}: {id}");
                 return ErrorCode::InvalidParameters;
-            } else {
-                // No matching cookie found, we can register this mapping
-                // We will use the first empty mapping slot in the entry
-                let cookie = *cookie;
-                let id = *id;
-                let ntype = *ntype;
+            }
 
-                let entry = &mut temp_entries[entry_index];
-                for mapping in &mut entry.mappings {
-                    if !mapping.in_use {
-                        info!("Mapping: cookie: {cookie}, id: {id}, ntype: {ntype:?}");
-                        mapping.cookie = cookie;
-                        mapping.id = id;
-                        mapping.ntype = ntype;
-                        mapping.src_id = req.src_id;
-                        mapping.in_use = true;
-                        temp_bitmask |= 1 << id; // Set the bit in the global bitmap
-                        applied = true;
-                        break;
-                    }
-                }
-            }
-            if !applied {
+            // Claim the first free mapping slot in the entry.
+            let entry = &mut temp_entries[entry_index];
+            let Some(mapping) = entry.mappings.iter_mut().find(|m| !m.in_use) else {
                 error!("Unable to apply mapping for cookie: {cookie}, id: {id}, ntype: {ntype:?}");
-                // Something went wrong, we could not apply the mapping, just bail here
                 return ErrorCode::NoMemory;
-            }
+            };
+            info!("Mapping: cookie: {cookie}, id: {id}, ntype: {ntype:?}");
+            mapping.cookie = cookie;
+            mapping.id = id;
+            mapping.ntype = ntype;
+            mapping.src_id = req.src_id;
+            mapping.in_use = true;
+            temp_bitmask |= bit;
         }
 
         // If we reach here, we have successfully registered the mappings, on to
@@ -332,99 +376,128 @@ impl Notify {
         info!("receiver_uuid: {:?}", req.receiver_uuid);
         info!("Count: {:?}", req.count);
 
-        if req.count == 0 || req.count >= NOTIFY_MAX_MAPPINGS_PER_REQ as u8 {
-            // If the count is zero or exceeds the maximum allowed mappings per request,
-            // we cannot register the service
-            error!("Invalid parameters: count is zero or exceeds maximum allowed mappings per request");
-            return NfySetupRsp {
-                reserved: 0,
-                sender_uuid: req.sender_uuid,
-                receiver_uuid: req.receiver_uuid,
-                msg_info: MESSAGE_INFO_DIR_RESP + MessageID::Setup as u64, // Response message for notification registration failure
-                status: ErrorCode::InvalidParameters,
-            };
+        if !(1..=NOTIFY_MAX_TUPLES_PER_REQ as u8).contains(&req.count) {
+            error!(
+                "Invalid parameters: count must be 1..={NOTIFY_MAX_TUPLES_PER_REQ}, got {}",
+                req.count
+            );
+            return NfySetupRsp::respond(MessageID::Setup, &req, ErrorCode::InvalidParameters);
         }
 
-        // First check to see if the service is already registered
-        let entry;
-        if let Some(entry_index) = self.nfy_find_entry(req.receiver_uuid) {
-            // If not registered, we will find an empty slot
-            info!("Service already registered, reusing entry: {entry_index}");
-            entry = Some(entry_index);
-        } else if let Some(empty_slot) = self.nfy_find_empty_slot() {
-            // If we found an empty slot, we can register the service
-            self.entries[empty_slot].in_use = true;
-            self.entries[empty_slot].service_uuid = req.receiver_uuid;
-            self.entries[empty_slot].mappings = [NfyMapping::default(); NOTIFY_MAX_MAPPINGS];
-            info!("Service registered, entry: {empty_slot}");
-            entry = Some(empty_slot);
-        } else {
-            // If no empty slot is found, we cannot register the service
-            return NfySetupRsp {
-                reserved: 0,
-                sender_uuid: req.sender_uuid,
-                receiver_uuid: req.receiver_uuid,
-                msg_info: MESSAGE_INFO_DIR_RESP + MessageID::Setup as u64, // Response message for notification registration failure
-                status: ErrorCode::NoMemory,
-            };
-        }
+        let Some(entry_index) = self.find_or_create_entry(req.receiver_uuid) else {
+            return NfySetupRsp::respond(MessageID::Setup, &req, ErrorCode::NoMemory);
+        };
 
-        if let Some(service_entry) = entry {
-            // Now we can process the request
-            let res = self.nfy_register_mapping(service_entry, req);
-
-            // Regardless of the result, we will return a response
-            return NfySetupRsp {
-                reserved: 0,
-                sender_uuid: req.sender_uuid,
-                receiver_uuid: req.receiver_uuid,
-                msg_info: MESSAGE_INFO_DIR_RESP + MessageID::Setup as u64, // Response message for notification registration failure
-                status: res,
-            };
-        }
-
-        NfySetupRsp {
-            reserved: 0,
-            sender_uuid: req.sender_uuid,
-            receiver_uuid: req.receiver_uuid,
-            msg_info: MESSAGE_INFO_DIR_RESP + MessageID::Setup as u64, // Response message for notification registration
-            status: ErrorCode::NoMemory,
-        }
+        let res = self.nfy_register_mapping(entry_index, req);
+        NfySetupRsp::respond(MessageID::Setup, &req, res)
     }
 
     fn nfy_destroy(&mut self, req: NotifyReq) -> NfySetupRsp {
-        // First check to see if the service is already registered
-        let entry = match self.nfy_find_entry(req.receiver_uuid) {
-            Some(entry_index) => {
-                // If registered, we will use the entry index
-                info!("Service found, entry: {entry_index}");
-                entry_index
-            }
-            None => {
-                // If not registered, we cannot unregister the service
-                error!("Service not found for UUID: {:?}", req.receiver_uuid);
-                // If no service entry is not found, we cannot unregister the service
-                return NfySetupRsp {
-                    reserved: 0,
-                    sender_uuid: req.sender_uuid,
-                    receiver_uuid: req.receiver_uuid,
-                    msg_info: MESSAGE_INFO_DIR_RESP + MessageID::Destroy as u64, // Response message for notification destroy failure
-                    status: ErrorCode::InvalidParameters,
-                };
-            }
+        let Some(entry) = self.nfy_find_entry(req.receiver_uuid) else {
+            error!("Service not found for UUID: {:?}", req.receiver_uuid);
+            return NfySetupRsp::respond(MessageID::Destroy, &req, ErrorCode::InvalidParameters);
         };
 
-        // Now we can process the request
         let res = self.nfy_unregister_mapping(entry, req);
+        NfySetupRsp::respond(MessageID::Destroy, &req, res)
+    }
 
-        // Regardless of the result, we will return a response
-        NfySetupRsp {
-            reserved: 0,
-            sender_uuid: req.sender_uuid,
-            receiver_uuid: req.receiver_uuid,
-            msg_info: MESSAGE_INFO_DIR_RESP + MessageID::Destroy as u64, // Response message for notification destroy
-            status: res,
+    fn nfy_add(&mut self, req: NotifyReq) -> NfySetupRsp {
+        if !(1..=NOTIFY_MAX_TUPLES_PER_REQ as u8).contains(&req.count) {
+            return NfySetupRsp::respond(MessageID::Add, &req, ErrorCode::InvalidParameters);
         }
+
+        let Some(entry_index) = self.find_or_create_entry(req.receiver_uuid) else {
+            return NfySetupRsp::respond(MessageID::Add, &req, ErrorCode::NoMemory);
+        };
+
+        let res = self.nfy_register_mapping(entry_index, req);
+        NfySetupRsp::respond(MessageID::Add, &req, res)
+    }
+
+    fn nfy_remove(&mut self, req: NotifyReq) -> NfySetupRsp {
+        let Some(entry) = self.nfy_find_entry(req.receiver_uuid) else {
+            return NfySetupRsp::respond(MessageID::Remove, &req, ErrorCode::InvalidParameters);
+        };
+
+        let res = self.nfy_unregister_mapping(entry, req);
+        NfySetupRsp::respond(MessageID::Remove, &req, res)
+    }
+
+    fn nfy_assign(&mut self, req: NotifyReq) -> NfySetupRsp {
+        let Some(entry_index) = self.nfy_find_entry(req.receiver_uuid) else {
+            return NfySetupRsp::respond(MessageID::Assign, &req, ErrorCode::InvalidParameters);
+        };
+
+        // Pre-validation pass: check all tuples before mutating any state.
+        // Track a simulated bitmap to detect cross-tuple conflicts.
+        let mut sim_bitmap = self.global_bitmap;
+        for (cookie, id, _ntype) in req.notifications.iter().take(req.count as usize) {
+            let mapping_index = match self.nfy_find_matching_cookie(entry_index, *cookie) {
+                Some(idx) => idx,
+                None => {
+                    error!("No matching cookie for assign: {cookie}");
+                    return NfySetupRsp::respond(MessageID::Assign, &req, ErrorCode::InvalidParameters);
+                }
+            };
+            let mapping = &self.entries[entry_index].mappings[mapping_index];
+            if let Some(old_bit) = nfy_bitmask(mapping.id) {
+                sim_bitmap &= !old_bit;
+            }
+            let new_bit = match nfy_bitmask(*id) {
+                Some(b) => b,
+                None => {
+                    error!("Assign id out of range: {id}");
+                    return NfySetupRsp::respond(MessageID::Assign, &req, ErrorCode::InvalidParameters);
+                }
+            };
+            if sim_bitmap & new_bit != 0 {
+                error!("Bitmask conflict during assign for id: {id}");
+                return NfySetupRsp::respond(MessageID::Assign, &req, ErrorCode::InvalidParameters);
+            }
+            sim_bitmap |= new_bit;
+        }
+
+        // All validated — apply mutations atomically.
+        for (cookie, id, ntype) in req.notifications.iter().take(req.count as usize) {
+            let mapping_index = self.nfy_find_matching_cookie(entry_index, *cookie).unwrap();
+            let mapping = &mut self.entries[entry_index].mappings[mapping_index];
+            mapping.id = *id;
+            mapping.ntype = *ntype;
+        }
+        self.global_bitmap = sim_bitmap;
+
+        NfySetupRsp::respond(MessageID::Assign, &req, ErrorCode::Ok)
+    }
+
+    fn nfy_unassign(&mut self, req: NotifyReq) -> NfySetupRsp {
+        let Some(entry_index) = self.nfy_find_entry(req.receiver_uuid) else {
+            return NfySetupRsp::respond(MessageID::Unassign, &req, ErrorCode::InvalidParameters);
+        };
+
+        // Pre-validation pass: ensure all cookies exist before mutating.
+        for (cookie, _id, _ntype) in req.notifications.iter().take(req.count as usize) {
+            if self.nfy_find_matching_cookie(entry_index, *cookie).is_none() {
+                error!("No matching cookie for unassign: {cookie}");
+                return NfySetupRsp::respond(MessageID::Unassign, &req, ErrorCode::InvalidParameters);
+            }
+        }
+
+        // All validated — apply mutations atomically.
+        let mut new_bitmap = self.global_bitmap;
+        for (cookie, _id, _ntype) in req.notifications.iter().take(req.count as usize) {
+            let mapping_index = self.nfy_find_matching_cookie(entry_index, *cookie).unwrap();
+            let mapping = &mut self.entries[entry_index].mappings[mapping_index];
+            if let Some(bit) = nfy_bitmask(mapping.id) {
+                new_bitmap &= !bit;
+            }
+            mapping.id = 0;
+            mapping.ntype = NotifyType::Global;
+            // Keep in_use = true and cookie — slot is reserved, just unassigned
+        }
+        self.global_bitmap = new_bitmap;
+
+        NfySetupRsp::respond(MessageID::Unassign, &req, ErrorCode::Ok)
     }
 }
 
@@ -436,18 +509,258 @@ impl Service for Notify {
         let req: NotifyReq = msg.clone().into();
         debug!("Received notify command: {:?}", req.msg_info.message_id());
 
-        let payload = match req.msg_info.message_id() {
+        let Some(message_id) = req.msg_info.message_id() else {
+            error!("Invalid notify message ID: {}", req.msg_info.0 & 0b111);
+            return Err(odp_ffa::Error::Other("Invalid notify message ID"));
+        };
+
+        let payload = match message_id {
             MessageID::Setup => DirectMessagePayload::from(self.nfy_setup(req)),
             MessageID::Destroy => DirectMessagePayload::from(self.nfy_destroy(req)),
-            MessageID::Add | MessageID::Remove | MessageID::Assign | MessageID::Unassign => {
-                // For Add, Remove, Assign, and Unassign, we just return unsupported
-                NfyGenericRsp {
-                    status: ErrorCode::NotSupported as i64,
-                }
-                .into()
-            }
+            MessageID::Add => DirectMessagePayload::from(self.nfy_add(req)),
+            MessageID::Remove => DirectMessagePayload::from(self.nfy_remove(req)),
+            MessageID::Assign => DirectMessagePayload::from(self.nfy_assign(req)),
+            MessageID::Unassign => DirectMessagePayload::from(self.nfy_unassign(req)),
         };
 
         Ok(MsgSendDirectResp2::from_req_with_payload(&msg, payload))
+    }
+}
+
+// ===========================================================================
+// Notify Unit Tests
+// ===========================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use odp_ffa::{DirectMessagePayload, HasRegisterPayload};
+    use uuid::uuid;
+
+    const NOTIFY_UUID: Uuid = uuid!("e474d87e-5731-4044-a727-cb3e8cf3c8df");
+    const SENDER_UUID: Uuid = uuid!("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+    const RECEIVER_UUID: Uuid = uuid!("11111111-2222-3333-4444-555555555555");
+
+    /// Build a notify request with given message_id, count, and notification tuples.
+    /// Each tuple is (cookie: u32, id: u16, ntype: 0=Global / 1=PerVcpu).
+    fn notify_req(msg_id: MessageID, count: u8, notifs: &[(u32, u16, u8)]) -> MsgSendDirectReq2 {
+        let mut regs = [0u64; 14];
+        // regs[1-2] = sender_uuid as LE u128 split into two u64s
+        let sender_le = SENDER_UUID.to_u128_le();
+        regs[1] = sender_le as u64;
+        regs[2] = (sender_le >> 64) as u64;
+        // regs[3-4] = receiver_uuid as LE u128 split into two u64s
+        let receiver_le = RECEIVER_UUID.to_u128_le();
+        regs[3] = receiver_le as u64;
+        regs[4] = (receiver_le >> 64) as u64;
+        // regs[5] = msg_info (bits 0-2 = message_id)
+        regs[5] = msg_id as u64;
+        // regs[6] = count (lower 9 bits)
+        regs[6] = count as u64;
+        // regs[7..] = notification tuples: cookie(bits63:32) | id(bits31:23) | type(bit0)
+        for (i, (cookie, id, ntype)) in notifs.iter().enumerate().take(7) {
+            regs[7 + i] = ((*cookie as u64) << 32) | ((*id as u64) << 23) | (*ntype as u64);
+        }
+        let payload_bytes = regs.iter().flat_map(|r| r.to_le_bytes());
+        let payload = DirectMessagePayload::from_iter(payload_bytes);
+        MsgSendDirectReq2::new(0x0001, 0x8001, NOTIFY_UUID, payload)
+    }
+
+    /// Extract the ErrorCode status from a NfySetupRsp-shaped response.
+    /// NfySetupRsp layout: reg0=reserved, reg1-2=sender_uuid, reg3-4=receiver_uuid,
+    /// reg5=msg_info, reg6=status.
+    fn resp_error_code(resp: &MsgSendDirectResp2) -> i64 {
+        resp.payload().register_at(6) as i64
+    }
+
+    /// Extract msg_info from response.
+    fn resp_msg_info(resp: &MsgSendDirectResp2) -> u64 {
+        resp.payload().register_at(5)
+    }
+
+    // ===================================================================
+    // Notify::Setup Test(s)
+    // ===================================================================
+    #[test]
+    fn test_setup_registers_service() {
+        let mut svc = Notify::new();
+        let msg = notify_req(MessageID::Setup, 1, &[(100, 1, 0)]);
+        let resp = svc.ffa_msg_send_direct_req2(msg).unwrap();
+        assert_eq!(resp_error_code(&resp), ErrorCode::Ok as i64);
+        assert_eq!(resp_msg_info(&resp), MESSAGE_INFO_DIR_RESP + MessageID::Setup as u64);
+    }
+
+    #[test]
+    fn test_setup_invalid_count_zero() {
+        let mut svc = Notify::new();
+        let msg = notify_req(MessageID::Setup, 0, &[]);
+        let resp = svc.ffa_msg_send_direct_req2(msg).unwrap();
+        assert_eq!(resp_error_code(&resp), ErrorCode::InvalidParameters as i64);
+    }
+
+    #[test]
+    fn test_setup_overflow_count_clamped() {
+        // NotifyReq::from() clamps count to NOTIFY_MAX_TUPLES_PER_REQ (7), so a
+        // raw count above the max is clamped rather than rejected. Verify a raw
+        // count of 8 still registers the 7 supplied tuples and succeeds.
+        let mut svc = Notify::new();
+        let tuples: [(u32, u16, u8); 7] = [
+            (100, 1, 0),
+            (101, 2, 0),
+            (102, 3, 0),
+            (103, 4, 0),
+            (104, 5, 0),
+            (105, 6, 0),
+            (106, 7, 0),
+        ];
+        let msg = notify_req(MessageID::Setup, NOTIFY_MAX_TUPLES_PER_REQ as u8 + 1, &tuples);
+        let resp = svc.ffa_msg_send_direct_req2(msg).unwrap();
+        assert_eq!(resp_error_code(&resp), ErrorCode::Ok as i64);
+    }
+
+    #[test]
+    fn test_setup_max_valid_count() {
+        // count=7 is the effective maximum (from() clamps to .min(7)).
+        // Verify 7 distinct tuples register successfully.
+        let mut svc = Notify::new();
+        let tuples: [(u32, u16, u8); 7] = [
+            (200, 10, 0),
+            (201, 11, 0),
+            (202, 12, 0),
+            (203, 13, 0),
+            (204, 14, 0),
+            (205, 15, 0),
+            (206, 16, 0),
+        ];
+        let msg = notify_req(MessageID::Setup, 7, &tuples);
+        let resp = svc.ffa_msg_send_direct_req2(msg).unwrap();
+        assert_eq!(resp_error_code(&resp), ErrorCode::Ok as i64);
+    }
+
+    // ===================================================================
+    // Notify::Destroy Test(s)
+    // ===================================================================
+    #[test]
+    fn test_destroy_after_setup() {
+        let mut svc = Notify::new();
+        // Setup first
+        let setup_msg = notify_req(MessageID::Setup, 1, &[(100, 1, 0)]);
+        let setup_resp = svc.ffa_msg_send_direct_req2(setup_msg).unwrap();
+        assert_eq!(resp_error_code(&setup_resp), ErrorCode::Ok as i64);
+
+        // Destroy with matching cookie/id/ntype
+        let destroy_msg = notify_req(MessageID::Destroy, 1, &[(100, 1, 0)]);
+        let destroy_resp = svc.ffa_msg_send_direct_req2(destroy_msg).unwrap();
+        assert_eq!(resp_error_code(&destroy_resp), ErrorCode::Ok as i64);
+        assert_eq!(
+            resp_msg_info(&destroy_resp),
+            MESSAGE_INFO_DIR_RESP + MessageID::Destroy as u64
+        );
+    }
+
+    #[test]
+    fn test_destroy_unregistered_returns_error() {
+        let mut svc = Notify::new();
+        let msg = notify_req(MessageID::Destroy, 1, &[(100, 1, 0)]);
+        let resp = svc.ffa_msg_send_direct_req2(msg).unwrap();
+        assert_eq!(resp_error_code(&resp), ErrorCode::InvalidParameters as i64);
+    }
+
+    // ===================================================================
+    // Notify::Add Test(s)
+    // ===================================================================
+    #[test]
+    fn test_add_registers_mapping() {
+        let mut svc = Notify::new();
+        let msg = notify_req(MessageID::Add, 1, &[(200, 2, 0)]);
+        let resp = svc.ffa_msg_send_direct_req2(msg).unwrap();
+        assert_eq!(resp_error_code(&resp), ErrorCode::Ok as i64);
+        assert_eq!(resp_msg_info(&resp), MESSAGE_INFO_DIR_RESP + MessageID::Add as u64);
+    }
+
+    // ===================================================================
+    // Notify::Remove Test(s)
+    // ===================================================================
+    #[test]
+    fn test_add_then_remove() {
+        let mut svc = Notify::new();
+        // First: Add a mapping
+        let add_msg = notify_req(MessageID::Add, 1, &[(200, 2, 0)]);
+        let add_resp = svc.ffa_msg_send_direct_req2(add_msg).unwrap();
+        assert_eq!(resp_error_code(&add_resp), ErrorCode::Ok as i64);
+
+        // Then: Remove it
+        let remove_msg = notify_req(MessageID::Remove, 1, &[(200, 2, 0)]);
+        let remove_resp = svc.ffa_msg_send_direct_req2(remove_msg).unwrap();
+        assert_eq!(resp_error_code(&remove_resp), ErrorCode::Ok as i64);
+        assert_eq!(
+            resp_msg_info(&remove_resp),
+            MESSAGE_INFO_DIR_RESP + MessageID::Remove as u64
+        );
+    }
+
+    #[test]
+    fn test_remove_without_add_returns_error() {
+        let mut svc = Notify::new();
+        let msg = notify_req(MessageID::Remove, 1, &[(200, 2, 0)]);
+        let resp = svc.ffa_msg_send_direct_req2(msg).unwrap();
+        assert_eq!(resp_error_code(&resp), ErrorCode::InvalidParameters as i64);
+    }
+
+    // ===================================================================
+    // Notify::Assign Test(s)
+    // ===================================================================
+    #[test]
+    fn test_assign_updates_mapping() {
+        let mut svc = Notify::new();
+        // Setup with 1 notification (cookie=100, id=1)
+        let setup_msg = notify_req(MessageID::Setup, 1, &[(100, 1, 0)]);
+        let setup_resp = svc.ffa_msg_send_direct_req2(setup_msg).unwrap();
+        assert_eq!(resp_error_code(&setup_resp), ErrorCode::Ok as i64);
+
+        // Assign same cookie with new id=5
+        let assign_msg = notify_req(MessageID::Assign, 1, &[(100, 5, 0)]);
+        let assign_resp = svc.ffa_msg_send_direct_req2(assign_msg).unwrap();
+        assert_eq!(resp_error_code(&assign_resp), ErrorCode::Ok as i64);
+        assert_eq!(
+            resp_msg_info(&assign_resp),
+            MESSAGE_INFO_DIR_RESP + MessageID::Assign as u64
+        );
+    }
+
+    #[test]
+    fn test_assign_without_entry_returns_error() {
+        let mut svc = Notify::new();
+        let msg = notify_req(MessageID::Assign, 1, &[(100, 5, 0)]);
+        let resp = svc.ffa_msg_send_direct_req2(msg).unwrap();
+        assert_eq!(resp_error_code(&resp), ErrorCode::InvalidParameters as i64);
+    }
+
+    // ===================================================================
+    // Notify::Unassign Test(s)
+    // ===================================================================
+    #[test]
+    fn test_unassign_clears_event() {
+        let mut svc = Notify::new();
+        // Setup with 1 notification (cookie=100, id=1)
+        let setup_msg = notify_req(MessageID::Setup, 1, &[(100, 1, 0)]);
+        let setup_resp = svc.ffa_msg_send_direct_req2(setup_msg).unwrap();
+        assert_eq!(resp_error_code(&setup_resp), ErrorCode::Ok as i64);
+
+        // Unassign by cookie
+        let unassign_msg = notify_req(MessageID::Unassign, 1, &[(100, 1, 0)]);
+        let unassign_resp = svc.ffa_msg_send_direct_req2(unassign_msg).unwrap();
+        assert_eq!(resp_error_code(&unassign_resp), ErrorCode::Ok as i64);
+        assert_eq!(
+            resp_msg_info(&unassign_resp),
+            MESSAGE_INFO_DIR_RESP + MessageID::Unassign as u64
+        );
+    }
+
+    #[test]
+    fn test_unassign_without_entry_returns_error() {
+        let mut svc = Notify::new();
+        let msg = notify_req(MessageID::Unassign, 1, &[(100, 1, 0)]);
+        let resp = svc.ffa_msg_send_direct_req2(msg).unwrap();
+        assert_eq!(resp_error_code(&resp), ErrorCode::InvalidParameters as i64);
     }
 }

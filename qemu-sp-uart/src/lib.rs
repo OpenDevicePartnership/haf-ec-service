@@ -4,19 +4,19 @@
 
 //! Minimal blocking PL011 MMIO driver for the QEMU SBSA secure partition.
 //!
-//! Polled TX (blocks while `UARTFR.TXFF` is set) and polled RX (busy-wait,
-//! unbounded, via [`Pl011Uart::read_byte_blocking`]). MMIO is fronted by
-//! the [`Mmio`] trait so the bit-twiddling is host-testable with a mock
+//! Polled TX (blocks while `UARTFR.TXFF` is set) and bounded polled RX
+//! (via [`Pl011Uart::read_byte_blocking`]). MMIO is fronted by the
+//! [`Mmio`] trait so the bit-twiddling is host-testable with a mock
 //! backend.
 //!
 //! # Base address contract
 //!
 //! [`Pl011Uart::new`] takes the MMIO `base` as a constructor parameter; the
-//! literal device address (`0x60030000` for the SP-side `ec_uart`) is NOT
+//! literal device address (`0x09040000` for the SP-side `ec_uart`) is NOT
 //! hard-coded inside this crate. The address is declared in the outer
 //! platform repo's SP DTS (`odp-platform-qemu-sbsa` →
 //! `mod/secure-services/platform/linker/qemu-ec-sp.dts`). The platform
-//! binary wires `Pl011Uart::new(0x60030000)` from `qemu-ec-sp::main`.
+//! binary wires `Pl011Uart::new(0x09040000)` from `qemu-ec-sp::main`.
 //!
 //! # Safety contract
 //!
@@ -91,9 +91,7 @@ pub const FR_TXFF: u32 = 1 << 5; // TX FIFO full
 /// PL011 driver errors.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Error {
-    /// Reserved for future bounded-poll variants. Currently unused by the
-    /// shipping methods (`write_bytes`, `read_byte_blocking`); kept for
-    /// API symmetry with the `Result` return types.
+    /// RX poll budget exhausted before a byte arrived.
     Timeout,
 }
 
@@ -153,10 +151,14 @@ impl<M: Mmio> Pl011Uart<M> {
         Ok(())
     }
 
-    /// Unbounded blocking read of one byte. Busy-spins until
-    /// `UARTFR.RXFE` clears.
-    pub fn read_byte_blocking(&mut self) -> Result<u8, Error> {
-        loop {
+    /// Default RX-poll budget for `read_byte_blocking`: ample for the
+    /// EC's ms-scale responses, finite so a stuck link can't hang.
+    pub const RX_POLL_BUDGET: u32 = 10_000_000;
+
+    /// Read one byte, polling `UARTFR.RXFE` up to `budget` times;
+    /// `Err(Error::Timeout)` if exhausted.
+    pub fn read_byte_bounded(&mut self, budget: u32) -> Result<u8, Error> {
+        for _ in 0..budget {
             // SAFETY: see `write_bytes`.
             let fr = unsafe { self.mmio.read32(UARTFR) };
             if fr & FR_RXFE == 0 {
@@ -165,6 +167,12 @@ impl<M: Mmio> Pl011Uart<M> {
             }
             core::hint::spin_loop();
         }
+        Err(Error::Timeout)
+    }
+
+    /// Blocking read of one byte, bounded by [`Self::RX_POLL_BUDGET`].
+    pub fn read_byte_blocking(&mut self) -> Result<u8, Error> {
+        self.read_byte_bounded(Self::RX_POLL_BUDGET)
     }
 }
 
@@ -309,5 +317,24 @@ mod tests {
         let mut uart = Pl011Uart::from_mmio(mock);
         assert_eq!(uart.read_byte_blocking().expect("read"), 0xAB);
         assert!(uart.mmio_for_test().fr_read_count() >= 3);
+    }
+
+    #[test]
+    fn read_byte_bounded_returns_timeout_when_rxfe_stays_set() {
+        let mock = MockMmio::new(FR_RXFE, 0xFF); // RXFE always set → never ready
+        let mut uart = Pl011Uart::from_mmio(mock);
+        let err = uart.read_byte_bounded(3).expect_err("should time out");
+        assert_eq!(err, Error::Timeout);
+        assert_eq!(uart.mmio_for_test().fr_read_count(), 3);
+    }
+
+    #[test]
+    fn read_byte_bounded_returns_byte_when_rxfe_clears_before_budget() {
+        let mut mock = MockMmio::new(0, 0xCD); // default 0 = RXFE clear
+        mock.push_fr(FR_RXFE); // first poll: empty
+        mock.push_fr(FR_RXFE); // second poll: empty
+                               // third+ polls: default 0 → ready → reads 0xCD
+        let mut uart = Pl011Uart::from_mmio(mock);
+        assert_eq!(uart.read_byte_bounded(10).expect("read"), 0xCD);
     }
 }

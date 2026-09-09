@@ -155,6 +155,9 @@ pub const TPM_MINOR_VER: u64 = 0x0;
 pub const NUM_LOCALITIES: u8 = 5;
 const NO_ACTIVE_LOCALITY: u8 = NUM_LOCALITIES; // Invalid locality
 
+// GetFeatureInfo payload flags. Bit 0 = TPM notifications supported.
+const TPM_FEATURE_NOTIFICATIONS_SUPPORTED: u64 = 1 << 0;
+
 // ---------------------------------------------------------------------------
 // TPM Service States
 // ---------------------------------------------------------------------------
@@ -223,19 +226,21 @@ pub struct TpmService<S: TpmSstOps> {
     interface_id_default: PtpCrbInterfaceIdentifier,
     locality_states: [TpmLocalityState; NUM_LOCALITIES as usize],
     tpm_internal_crb_address: u64,
+    notification_registered: bool,
     pub sst: S,
 }
 
 impl<S: TpmSstOps> TpmService<S> {
     // Creates an uninitialized 'TpmService'. Call [`init`] to set up state. Init
     // will initialize the internal variables.
-    pub fn new(sst: S) -> Self {
+    pub fn new(sst: S, tpm_internal_crb_address: u64) -> Self {
         Self {
             current_state: TpmState::Idle,
             active_locality: NO_ACTIVE_LOCALITY,
             interface_id_default: PtpCrbInterfaceIdentifier::new(),
             locality_states: [TpmLocalityState::Closed; NUM_LOCALITIES as usize],
-            tpm_internal_crb_address: 0x10000200000,
+            tpm_internal_crb_address,
+            notification_registered: false,
             sst,
         }
     }
@@ -348,6 +353,15 @@ impl<S: TpmSstOps> TpmService<S> {
     //         initializing the library.
     unsafe fn handle_command(&mut self) -> TpmStatus {
         let crb = &mut *self.crb_ptr(self.active_locality);
+
+        // Per DEN0138, an empty CRB control request/start register returns
+        // INV_CRB_CTRL_DATA. This catches the case where Start(COMMAND) is
+        // issued before any state-transition bit is written to the CRB.
+        if crb.crb_control_request == 0 && crb.crb_control_start == 0 {
+            error!("CRB has no operation requested");
+            return TpmStatus::InvCrbCtrlData;
+        }
+
         let mut status: ErrorCode = ErrorCode::Denied;
 
         // The normal state flow should be: IDLE -> READY -> COMPLETE -> IDLE.
@@ -476,10 +490,11 @@ impl<S: TpmSstOps> TpmService<S> {
             info!("Handle TPM Locality{:X} Request", locality);
             status = self.sst.locality_request(locality);
             new_active_locality = locality;
-        // Otherwise, the host didn't set the correct bits, invalid.
+        // Otherwise, the host didn't set the correct bits — per DEN0138, the
+        // locality control data is invalid.
         } else {
             error!("Request/Relinquish Bit Not Set");
-            return TpmStatus::Denied;
+            return TpmStatus::InvCrbCtrlData;
         }
 
         // Update the internal TPM CRB.
@@ -499,9 +514,15 @@ impl<S: TpmSstOps> TpmService<S> {
         TpmStatus::OkResultsReturned
     }
 
-    fn get_feature_info_handler(&self, _request: &TpmRequest, _response: &mut TpmResponse) -> TpmStatus {
-        error!("Unsupported Function");
-        TpmStatus::NotSup
+    fn get_feature_info_handler(&self, request: &TpmRequest, response: &mut TpmResponse) -> TpmStatus {
+        // Feature ID is in the function field (Arg1). Only the notification
+        // feature (RegisterForNotification) is currently queryable.
+        if request.function == TpmFunction::RegisterForNotification as u64 {
+            response.tpm_payload = TPM_FEATURE_NOTIFICATIONS_SUPPORTED;
+            TpmStatus::OkResultsReturned
+        } else {
+            TpmStatus::NotSup
+        }
     }
 
     // SAFETY: Function invokes both handle_command and handle_locality_request which can
@@ -538,19 +559,32 @@ impl<S: TpmSstOps> TpmService<S> {
         return_val
     }
 
-    fn register_handler(&self, _request: &TpmRequest, _response: &mut TpmResponse) -> TpmStatus {
-        error!("Unsupported Function");
-        TpmStatus::NotSup
+    fn register_handler(&mut self, _request: &TpmRequest, _response: &mut TpmResponse) -> TpmStatus {
+        if self.notification_registered {
+            TpmStatus::Already
+        } else {
+            self.notification_registered = true;
+            TpmStatus::Ok
+        }
     }
 
-    fn unregister_handler(&self, _request: &TpmRequest, _response: &mut TpmResponse) -> TpmStatus {
-        error!("Unsupported Function");
-        TpmStatus::NotSup
+    fn unregister_handler(&mut self, _request: &TpmRequest, _response: &mut TpmResponse) -> TpmStatus {
+        if !self.notification_registered {
+            TpmStatus::Denied
+        } else {
+            self.notification_registered = false;
+            TpmStatus::Ok
+        }
     }
 
-    fn finish_handler(&self, _request: &TpmRequest, _response: &mut TpmResponse) -> TpmStatus {
-        error!("Unsupported Function");
-        TpmStatus::NotSup
+    fn finish_handler(&mut self, _request: &TpmRequest, _response: &mut TpmResponse) -> TpmStatus {
+        if !self.notification_registered {
+            TpmStatus::Denied
+        } else {
+            // Acknowledge notification completion — no additional state change needed
+            // since notifications are edge-triggered in this stub implementation
+            TpmStatus::Ok
+        }
     }
 
     fn manage_locality_handler(&mut self, request: &TpmRequest, _response: &mut TpmResponse) -> TpmStatus {
@@ -583,7 +617,7 @@ impl<S: TpmSstOps> TpmService<S> {
     /// init_internal_crb. This sets all locality regions to known valid
     /// values. The internal and external TPM CRB addresses must be valid
     /// memory regions passed in by the caller.
-    pub unsafe fn init(&mut self, tpm_internal_crb_address: u64, tpm_external_crb_address: u64) {
+    pub unsafe fn init(&mut self) {
         // Build the default interface ID.
         self.interface_id_default = PtpCrbInterfaceIdentifier::new();
         self.interface_id_default
@@ -592,9 +626,6 @@ impl<S: TpmSstOps> TpmService<S> {
             .set_interface_version(PtpCrbInterfaceVersion::Crb as u32);
         self.interface_id_default.set_cap_locality(1); // 5 localities supported
         self.interface_id_default.set_cap_crb(1); // CRB supported
-
-        // Set the internal TPM CRB address.
-        self.tpm_internal_crb_address = tpm_internal_crb_address;
 
         for locality in 0..NUM_LOCALITIES {
             self.init_internal_crb(locality);
@@ -610,15 +641,23 @@ impl<S: TpmSstOps> TpmService<S> {
         self.locality_states[4] = TpmLocalityState::Closed;
 
         // Initialize the TPM Service State Translation Library.
-        self.sst.init(tpm_external_crb_address);
+        self.sst.init();
 
+        self.reset_runtime_state();
+    }
+
+    // Resets the volatile runtime state shared by init and deinit. Does NOT
+    // touch per-locality open/closed state (deinit handles that separately).
+    fn reset_runtime_state(&mut self) {
         self.current_state = TpmState::Idle;
         self.active_locality = NO_ACTIVE_LOCALITY;
+        self.notification_registered = false;
     }
 
     /// De-initializes the TPM service (equivalent to `TpmServiceDeInit`).
     pub fn deinit(&mut self) {
-        // Nothing to de-init.
+        self.reset_runtime_state();
+        self.locality_states = [TpmLocalityState::Closed; NUM_LOCALITIES as usize];
     }
 
     /// Test-only: write a specific value to a CRB register in the internal CRB.
@@ -628,6 +667,7 @@ impl<S: TpmSstOps> TpmService<S> {
     ///   2 = crb_control_request = CMD_READY
     ///   3 = crb_control_request = GO_IDLE
     ///   4 = crb_control_start = START
+    ///   5 = prepare TPM2_Startup command in CRB data buffer
     #[cfg(feature = "test-bypass-locality-check")]
     fn test_write_crb(&mut self, request: &TpmRequest) -> TpmStatus {
         let operation = request.function as u16;
@@ -645,6 +685,14 @@ impl<S: TpmSstOps> TpmService<S> {
             2 => crb.crb_control_request = PTP_CRB_CONTROL_AREA_REQUEST_COMMAND_READY,
             3 => crb.crb_control_request = PTP_CRB_CONTROL_AREA_REQUEST_GO_IDLE,
             4 => crb.crb_control_start = PTP_CRB_CONTROL_START,
+            5 => {
+                // Write a TPM2_Startup(CLEAR) command into the CRB data buffer.
+                // TPM2_Startup header (big-endian):
+                //   tag=0x8001, size=12, code=0x144, startupType=0x0000
+                let tpm2_startup: [u8; 12] = [0x80, 0x01, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x01, 0x44, 0x00, 0x00];
+                crb.crb_data_buffer[..12].copy_from_slice(&tpm2_startup);
+                crb.crb_control_command_size = 12;
+            }
             _ => {
                 error!("test_write_crb: Invalid Operation");
                 return TpmStatus::InvArg;
@@ -724,7 +772,7 @@ mod tests {
     use odp_ffa::DirectMessagePayload;
 
     const TPM_SERVICE_UUID: Uuid = uuid!("17b862a4-1806-4faf-86b3-089a58353861");
-    const EXTERNAL_TPM_CRB_ADDR: u64 = 0x60120000;
+    const EXTERNAL_TPM_CRB_ADDR: u64 = 0x0C000000;
 
     // =======================================================================
     // Mock CrbRegion
@@ -767,7 +815,7 @@ mod tests {
         fn is_idle_bypass_supported(&self) -> bool {
             false
         }
-        fn init(&mut self, _tpm_external_crb_address: u64) {
+        fn init(&mut self) {
             // Do nothing
         }
     }
@@ -895,7 +943,7 @@ mod tests {
     // =======================================================================
     #[test]
     fn test_tpm_service_new_defaults() {
-        let service = TpmService::new(MockTpmSst::new());
+        let service = TpmService::new(MockTpmSst::new(), 0x0);
         assert_eq!(service.current_state, TpmState::Idle);
         assert_eq!(service.active_locality, NO_ACTIVE_LOCALITY);
         assert_eq!(service.interface_id_default.0, 0);
@@ -903,7 +951,7 @@ mod tests {
             service.locality_states,
             [TpmLocalityState::Closed; NUM_LOCALITIES as usize],
         );
-        assert_eq!(service.tpm_internal_crb_address, 0x10000200000);
+        assert_eq!(service.tpm_internal_crb_address, 0x0);
     }
 
     // =======================================================================
@@ -912,8 +960,8 @@ mod tests {
     #[test]
     fn test_tpm_service_init() {
         let (_buff, addr) = alloc_crb_region();
-        let mut service = TpmService::new(MockTpmSst::new());
-        unsafe { service.init(addr, EXTERNAL_TPM_CRB_ADDR) };
+        let mut service = TpmService::new(MockTpmSst::new(), addr);
+        unsafe { service.init() };
         assert_eq!(
             service.interface_id_default.interface_type(),
             PtpCrbInterfaceType::Crb as u32
@@ -1003,7 +1051,8 @@ mod tests {
     // =======================================================================
     #[test]
     fn test_get_interface_version() {
-        let mut service = TpmService::new(MockTpmSst::new());
+        let (_buff, addr) = alloc_crb_region();
+        let mut service = TpmService::new(MockTpmSst::new(), addr);
         let msg = direct_req2_msg(0x0000, 0x0000, TpmFunction::GetInterfaceVersion as u64, 0x00, 0x00);
         let resp = service.ffa_msg_send_direct_req2(msg).unwrap();
         assert_eq!(resp_status(&resp), TpmStatus::OkResultsReturned as u64);
@@ -1016,7 +1065,8 @@ mod tests {
     // =======================================================================
     #[test]
     fn test_get_feature_info() {
-        let mut service = TpmService::new(MockTpmSst::new());
+        let (_buff, addr) = alloc_crb_region();
+        let mut service = TpmService::new(MockTpmSst::new(), addr);
         let msg = direct_req2_msg(0x0000, 0x0000, TpmFunction::GetFeatureInfo as u64, 0x00, 0x00);
         let resp = service.ffa_msg_send_direct_req2(msg).unwrap();
         assert_eq!(resp_status(&resp), TpmStatus::NotSup as u64);
@@ -1028,8 +1078,8 @@ mod tests {
     #[test]
     fn test_start_locality_request() {
         let (_buff, addr) = alloc_crb_region();
-        let mut service = TpmService::new(MockTpmSst::new());
-        unsafe { service.init(addr, EXTERNAL_TPM_CRB_ADDR) };
+        let mut service = TpmService::new(MockTpmSst::new(), addr);
+        unsafe { service.init() };
         let crb: &mut PtpCrbRegisters = unsafe { &mut (*service.crb_ptr(0)) };
 
         let open_msg = direct_req2_msg(
@@ -1061,8 +1111,8 @@ mod tests {
     #[test]
     fn test_start_command() {
         let (_buff, addr) = alloc_crb_region();
-        let mut service = TpmService::new(MockTpmSst::new());
-        unsafe { service.init(addr, EXTERNAL_TPM_CRB_ADDR) };
+        let mut service = TpmService::new(MockTpmSst::new(), addr);
+        unsafe { service.init() };
         let crb: &mut PtpCrbRegisters = unsafe { &mut (*service.crb_ptr(0)) };
 
         let open_msg = direct_req2_msg(
@@ -1137,8 +1187,8 @@ mod tests {
     #[test]
     fn test_start_locality_relinquish() {
         let (_buff, addr) = alloc_crb_region();
-        let mut service = TpmService::new(MockTpmSst::new());
-        unsafe { service.init(addr, EXTERNAL_TPM_CRB_ADDR) };
+        let mut service = TpmService::new(MockTpmSst::new(), addr);
+        unsafe { service.init() };
         let crb: &mut PtpCrbRegisters = unsafe { &mut (*service.crb_ptr(0)) };
 
         let open_msg = direct_req2_msg(
@@ -1183,7 +1233,7 @@ mod tests {
 
     #[test]
     fn test_start_invalid_locality() {
-        let mut service = TpmService::new(MockTpmSst::new());
+        let mut service = TpmService::new(MockTpmSst::new(), 0x0);
         let msg = direct_req2_msg(
             0x0000,
             0x0000,
@@ -1197,7 +1247,7 @@ mod tests {
 
     #[test]
     fn test_start_locality_closed() {
-        let mut service = TpmService::new(MockTpmSst::new());
+        let mut service = TpmService::new(MockTpmSst::new(), 0x0);
         let msg = direct_req2_msg(
             0x0000,
             0x0000,
@@ -1212,7 +1262,7 @@ mod tests {
 
     #[test]
     fn test_start_locality_mismatch() {
-        let mut service = TpmService::new(MockTpmSst::new());
+        let mut service = TpmService::new(MockTpmSst::new(), 0x0);
         let open_msg = direct_req2_msg(
             0xFF00,
             0x0000,
@@ -1237,7 +1287,7 @@ mod tests {
 
     #[test]
     fn test_start_invalid_function() {
-        let mut service = TpmService::new(MockTpmSst::new());
+        let mut service = TpmService::new(MockTpmSst::new(), 0x0);
         service.locality_states[0] = TpmLocalityState::Open;
         let msg = direct_req2_msg(
             0x0000,
@@ -1255,10 +1305,10 @@ mod tests {
     // =======================================================================
     #[test]
     fn test_register() {
-        let mut service = TpmService::new(MockTpmSst::new());
+        let mut service = TpmService::new(MockTpmSst::new(), 0x0);
         let msg = direct_req2_msg(0x0000, 0x0000, TpmFunction::RegisterForNotification as u64, 0x00, 0x00);
         let resp = service.ffa_msg_send_direct_req2(msg).unwrap();
-        assert_eq!(resp_status(&resp), TpmStatus::NotSup as u64);
+        assert_eq!(resp_status(&resp), TpmStatus::Ok as u64);
     }
 
     // =======================================================================
@@ -1266,7 +1316,7 @@ mod tests {
     // =======================================================================
     #[test]
     fn test_unregister() {
-        let mut service = TpmService::new(MockTpmSst::new());
+        let mut service = TpmService::new(MockTpmSst::new(), 0x0);
         let msg = direct_req2_msg(
             0x0000,
             0x0000,
@@ -1275,7 +1325,7 @@ mod tests {
             0x00,
         );
         let resp = service.ffa_msg_send_direct_req2(msg).unwrap();
-        assert_eq!(resp_status(&resp), TpmStatus::NotSup as u64);
+        assert_eq!(resp_status(&resp), TpmStatus::Denied as u64);
     }
 
     // =======================================================================
@@ -1283,10 +1333,10 @@ mod tests {
     // =======================================================================
     #[test]
     fn test_finish() {
-        let mut service = TpmService::new(MockTpmSst::new());
+        let mut service = TpmService::new(MockTpmSst::new(), 0x0);
         let msg = direct_req2_msg(0x0000, 0x0000, TpmFunction::FinishNotified as u64, 0x00, 0x00);
         let resp = service.ffa_msg_send_direct_req2(msg).unwrap();
-        assert_eq!(resp_status(&resp), TpmStatus::NotSup as u64);
+        assert_eq!(resp_status(&resp), TpmStatus::Denied as u64);
     }
 
     // =======================================================================
@@ -1294,7 +1344,7 @@ mod tests {
     // =======================================================================
     #[test]
     fn test_manage_locality_open() {
-        let mut service = TpmService::new(MockTpmSst::new());
+        let mut service = TpmService::new(MockTpmSst::new(), 0x0);
         let msg = direct_req2_msg(
             0xFF00,
             0x0000,
@@ -1309,7 +1359,7 @@ mod tests {
 
     #[test]
     fn test_manage_locality_close() {
-        let mut service = TpmService::new(MockTpmSst::new());
+        let mut service = TpmService::new(MockTpmSst::new(), 0x0);
         // NOTE: This is only possible because this unit test is within this module. The
         //       locality_states array should only be accessible by the service.
         service.locality_states[0] = TpmLocalityState::Open;
@@ -1327,7 +1377,7 @@ mod tests {
 
     #[test]
     fn test_manage_locality_invalid_function() {
-        let mut service = TpmService::new(MockTpmSst::new());
+        let mut service = TpmService::new(MockTpmSst::new(), 0x0);
         let msg = direct_req2_msg(
             0xFF00,
             0x0000,
@@ -1341,7 +1391,7 @@ mod tests {
 
     #[test]
     fn test_manage_locality_invalid_locality() {
-        let mut service = TpmService::new(MockTpmSst::new());
+        let mut service = TpmService::new(MockTpmSst::new(), 0x0);
         let msg = direct_req2_msg(
             0xFF00,
             0x0000,
@@ -1355,7 +1405,7 @@ mod tests {
 
     #[test]
     fn test_manage_locality_invalid_source() {
-        let mut service = TpmService::new(MockTpmSst::new());
+        let mut service = TpmService::new(MockTpmSst::new(), 0x0);
         // source_id high byte is NOT 0xFF → should be denied
         let msg = direct_req2_msg(
             0x0000, // Invalid Source ID
@@ -1370,7 +1420,7 @@ mod tests {
 
     #[test]
     fn test_manage_locality_open_all_localities() {
-        let mut service = TpmService::new(MockTpmSst::new());
+        let mut service = TpmService::new(MockTpmSst::new(), 0x0);
         for loc in 0..NUM_LOCALITIES {
             let msg = direct_req2_msg(
                 0xFF00,
@@ -1387,7 +1437,7 @@ mod tests {
 
     #[test]
     fn test_manage_locality_close_all_localities() {
-        let mut service = TpmService::new(MockTpmSst::new());
+        let mut service = TpmService::new(MockTpmSst::new(), 0x0);
         for locality in 0..NUM_LOCALITIES {
             let msg = direct_req2_msg(
                 0xFF00,
@@ -1407,9 +1457,160 @@ mod tests {
     // =======================================================================
     #[test]
     fn test_invalid_opcode() {
-        let mut service = TpmService::new(MockTpmSst::new());
+        let mut service = TpmService::new(MockTpmSst::new(), 0x0);
         let msg = direct_req2_msg(0, 0, 0xDEAD_BEEF, 0, 0);
         let resp = service.ffa_msg_send_direct_req2(msg).unwrap();
         assert_eq!(resp_status(&resp), TpmStatus::NoFunc as u64);
+    }
+
+    // =======================================================================
+    // TpmService::GetFeatureInfo Extended Test(s)
+    // =======================================================================
+    #[test]
+    fn test_get_feature_info_notification() {
+        let mut service = TpmService::new(MockTpmSst::new(), 0x0);
+        let msg = direct_req2_msg(
+            0x0000,
+            0x0000,
+            TpmFunction::GetFeatureInfo as u64,
+            TpmFunction::RegisterForNotification as u64, // Query notification feature
+            0x00,
+        );
+        let resp = service.ffa_msg_send_direct_req2(msg).unwrap();
+        assert_eq!(resp_status(&resp), TpmStatus::OkResultsReturned as u64);
+        assert_eq!(resp_payload(&resp) & 0x1, 0x1); // Notifications supported
+    }
+
+    #[test]
+    fn test_get_feature_info_unknown_feature() {
+        // Mirrors existing test_get_feature_info — unknown feature returns NotSup
+        let mut service = TpmService::new(MockTpmSst::new(), 0x0);
+        let msg = direct_req2_msg(
+            0x0000,
+            0x0000,
+            TpmFunction::GetFeatureInfo as u64,
+            0x00, // Unknown feature ID
+            0x00,
+        );
+        let resp = service.ffa_msg_send_direct_req2(msg).unwrap();
+        assert_eq!(resp_status(&resp), TpmStatus::NotSup as u64);
+    }
+
+    // =======================================================================
+    // TpmService::Register/Unregister State Transition Test(s)
+    // =======================================================================
+    #[test]
+    fn test_register_then_unregister() {
+        let mut service = TpmService::new(MockTpmSst::new(), 0x0);
+        // Register
+        let msg = direct_req2_msg(0x0000, 0x0000, TpmFunction::RegisterForNotification as u64, 0, 0);
+        let resp = service.ffa_msg_send_direct_req2(msg).unwrap();
+        assert_eq!(resp_status(&resp), TpmStatus::Ok as u64);
+        assert!(service.notification_registered);
+
+        // Unregister
+        let msg = direct_req2_msg(0x0000, 0x0000, TpmFunction::UnregisterForNotification as u64, 0, 0);
+        let resp = service.ffa_msg_send_direct_req2(msg).unwrap();
+        assert_eq!(resp_status(&resp), TpmStatus::Ok as u64);
+        assert!(!service.notification_registered);
+    }
+
+    #[test]
+    fn test_register_double_returns_already() {
+        let mut service = TpmService::new(MockTpmSst::new(), 0x0);
+        let msg = direct_req2_msg(0x0000, 0x0000, TpmFunction::RegisterForNotification as u64, 0, 0);
+        service.ffa_msg_send_direct_req2(msg.clone()).unwrap();
+        let resp = service.ffa_msg_send_direct_req2(msg).unwrap();
+        assert_eq!(resp_status(&resp), TpmStatus::Already as u64);
+    }
+
+    #[test]
+    fn test_unregister_without_register_returns_denied() {
+        let mut service = TpmService::new(MockTpmSst::new(), 0x0);
+        let msg = direct_req2_msg(0x0000, 0x0000, TpmFunction::UnregisterForNotification as u64, 0, 0);
+        let resp = service.ffa_msg_send_direct_req2(msg).unwrap();
+        assert_eq!(resp_status(&resp), TpmStatus::Denied as u64);
+    }
+
+    // =======================================================================
+    // TpmService::Finish Test(s) — Extended
+    // =======================================================================
+    #[test]
+    fn test_finish_after_register() {
+        let mut service = TpmService::new(MockTpmSst::new(), 0x0);
+        // Register first
+        let reg_msg = direct_req2_msg(0x0000, 0x0000, TpmFunction::RegisterForNotification as u64, 0, 0);
+        service.ffa_msg_send_direct_req2(reg_msg).unwrap();
+
+        // Finish should succeed
+        let msg = direct_req2_msg(0x0000, 0x0000, TpmFunction::FinishNotified as u64, 0, 0);
+        let resp = service.ffa_msg_send_direct_req2(msg).unwrap();
+        assert_eq!(resp_status(&resp), TpmStatus::Ok as u64);
+    }
+
+    #[test]
+    fn test_finish_without_register_returns_denied() {
+        let mut service = TpmService::new(MockTpmSst::new(), 0x0);
+        let msg = direct_req2_msg(0x0000, 0x0000, TpmFunction::FinishNotified as u64, 0, 0);
+        let resp = service.ffa_msg_send_direct_req2(msg).unwrap();
+        assert_eq!(resp_status(&resp), TpmStatus::Denied as u64);
+    }
+
+    // =======================================================================
+    // TpmService::Deinit Test(s)
+    // =======================================================================
+    #[test]
+    fn test_deinit_resets_state() {
+        let (buff, addr) = alloc_crb_region();
+        let mut service = TpmService::new(MockTpmSst::new(), addr);
+        unsafe { service.init() };
+
+        // Open a locality
+        let open_msg = direct_req2_msg(
+            0xFF00,
+            0x0000,
+            TpmFunction::ManageLocality as u64,
+            TPM2_FFA_MANAGE_LOCALITY_OPEN as u64,
+            0,
+        );
+        service.ffa_msg_send_direct_req2(open_msg).unwrap();
+
+        // Register notification
+        let reg_msg = direct_req2_msg(0x0000, 0x0000, TpmFunction::RegisterForNotification as u64, 0, 0);
+        service.ffa_msg_send_direct_req2(reg_msg).unwrap();
+
+        // Verify state is modified
+        assert_eq!(service.locality_states[0], TpmLocalityState::Open);
+        assert!(service.notification_registered);
+
+        // Deinit should reset everything
+        service.deinit();
+        assert_eq!(service.current_state, TpmState::Idle);
+        assert_eq!(service.active_locality, NO_ACTIVE_LOCALITY);
+        assert_eq!(
+            service.locality_states,
+            [TpmLocalityState::Closed; NUM_LOCALITIES as usize]
+        );
+        assert!(!service.notification_registered);
+
+        drop(buff); // prevent early deallocation
+    }
+
+    #[test]
+    fn test_register_after_deinit() {
+        let mut service = TpmService::new(MockTpmSst::new(), 0x0);
+        // Register, then deinit
+        let reg_msg = direct_req2_msg(0x0000, 0x0000, TpmFunction::RegisterForNotification as u64, 0, 0);
+        service.ffa_msg_send_direct_req2(reg_msg).unwrap();
+        assert!(service.notification_registered);
+
+        service.deinit();
+        assert!(!service.notification_registered);
+
+        // Re-register should work (state was properly reset)
+        let reg_msg2 = direct_req2_msg(0x0000, 0x0000, TpmFunction::RegisterForNotification as u64, 0, 0);
+        let resp = service.ffa_msg_send_direct_req2(reg_msg2).unwrap();
+        assert_eq!(resp_status(&resp), TpmStatus::Ok as u64);
+        assert!(service.notification_registered);
     }
 }

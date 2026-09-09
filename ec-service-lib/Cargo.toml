@@ -18,6 +18,7 @@ odp-ffa.workspace = true
 num_enum.workspace = true
 log.workspace = true
 embedded-io.workspace = true
+zerocopy.workspace = true
 mctp-rs = { workspace = true, features = ["serial"] }
 
 [target.'cfg(target_os = "none")'.dependencies]
@@ -34,6 +35,12 @@ aarch64-cpu.workspace = true
 embedded-services.workspace = true
 battery-service-relay.workspace = true
 battery-service-interface.workspace = true
+thermal-service-relay.workspace = true
+time-alarm-service-relay.workspace = true
+time-alarm-service-interface.workspace = true
+# Independent UCSI wire-format oracle — used only by host `#[cfg(test)]` gate
+# tests in services/ucsi.rs. Never a runtime dep (the SP hand-encodes bytes).
+embedded-usb-pd.workspace = true
 
 [target.'cfg(not(target_os = "none"))'.dev-dependencies]
 critical-section = { workspace = true, features = ["std"] }

@@ -37,6 +37,21 @@ criteria = "safe-to-deploy"
 version = "1.5.1"
 criteria = "safe-to-deploy"
 
+[[exemptions.bincode]]
+version = "2.0.1"
+criteria = "safe-to-run"
+notes = "Host-test-only embedded-usb-pd wire-format oracle."
+
+[[exemptions.bitfield]]
+version = "0.19.5"
+criteria = "safe-to-run"
+notes = "Host-test-only embedded-usb-pd wire-format oracle."
+
+[[exemptions.bitfield-macros]]
+version = "0.19.5"
+criteria = "safe-to-run"
+notes = "Host-test-only embedded-usb-pd wire-format oracle."
+
 [[exemptions.bitflags]]
 version = "2.11.1"
 criteria = "safe-to-deploy"
@@ -53,10 +68,47 @@ criteria = "safe-to-deploy"
 version = "0.4.44"
 criteria = "safe-to-deploy"
 
+[[exemptions.document-features]]
+version = "0.2.12"
+criteria = "safe-to-run"
+
+[[exemptions.embassy-time]]
+version = "0.5.1"
+criteria = "safe-to-run"
+
+[[exemptions.embassy-time-driver]]
+version = "0.2.2"
+criteria = "safe-to-run"
+
+[[exemptions.embedded-fans]]
+version = "0.1.0"
+criteria = "safe-to-run"
+
+[[exemptions.embedded-fans-async]]
+version = "0.2.0"
+criteria = "safe-to-run"
+
+[[exemptions.embedded-hal-async]]
+version = "1.0.0"
+criteria = "safe-to-run"
+
 [[exemptions.embedded-io]]
 version = "0.6.1"
 criteria = "safe-to-deploy"
 notes = "Widely-used embedded-io traits from Embedded WG (Dirbaio). Delta to 0.7.1 covered by ODP import."
+
+[[exemptions.embedded-mcu-hal]]
+version = "0.3.0"
+criteria = "safe-to-run"
+notes = "Dev-only dependency of TimeAlarm relay/interface host compatibility tests."
+
+[[exemptions.embedded-sensors-hal]]
+version = "0.1.1"
+criteria = "safe-to-run"
+
+[[exemptions.embedded-sensors-hal-async]]
+version = "0.3.0"
+criteria = "safe-to-run"
 
 [[exemptions.futures-core]]
 version = "0.3.32"
@@ -102,6 +154,10 @@ criteria = "safe-to-deploy"
 version = "0.2.186"
 criteria = "safe-to-deploy"
 
+[[exemptions.litrs]]
+version = "1.0.0"
+criteria = "safe-to-run"
+
 [[exemptions.memchr]]
 version = "2.8.0"
 criteria = "safe-to-run"
@@ -123,6 +179,11 @@ criteria = "safe-to-deploy"
 version = "2.0.117"
 criteria = "safe-to-deploy"
 
+[[exemptions.syn]]
+version = "3.0.3"
+criteria = "safe-to-run"
+notes = "Host-test-only embedded-usb-pd wire-format oracle."
+
 [[exemptions.thiserror]]
 version = "2.0.18"
 criteria = "safe-to-deploy"
@@ -137,8 +198,13 @@ notes = "thiserror proc-macro transitive."
 version = "0.9.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.unty]]
+version = "0.0.4"
+criteria = "safe-to-run"
+notes = "Host-test-only embedded-usb-pd wire-format oracle."
+
 [[exemptions.uuid]]
-version = "1.23.1"
+version = "1.17.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.wasm-bindgen]]

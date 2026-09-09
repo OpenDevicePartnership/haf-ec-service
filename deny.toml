@@ -76,6 +76,8 @@ ignore = [
     #{ crate = "a-crate-that-is-yanked@0.1.1", reason = "you can specify why you are ignoring the yanked crate" },
     #{ id = "RUSTSEC-2024-0370", reason = "proc-macro-error is unmaintained, no safe upgrade available, need upstream dependencies to migrate away from it." },
     { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained; transitive dep via embedded-services. No safe upgrade available, awaiting upstream migration to pastey." },
+    { id = "RUSTSEC-2025-0141", reason = "bincode is an unmaintained transitive dependency of the host-test-only embedded-usb-pd wire-format oracle. It is not linked into secure-partition builds, and no safe upgrade is available." },
+    { id = "RUSTSEC-2026-0110", reason = "bare-metal is unmaintained; transitive host-test dependency via embedded-services and cortex-m. No safe upgrade is available." },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.

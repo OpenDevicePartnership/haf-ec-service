@@ -25,6 +25,8 @@
 	 * EC_SVC_POWER 		7157addf-2fbe-4c63-ae95-efac16e3b01c
 	 * EC_SVC_BATTERY 		25cb5207-ac36-427d-aaef-3aa78877d27e
 	 * EC_SVC_THERMAL		31f56da7-593c-4d72-a4b3-8fc7171ac073
+	 * EC_SVC_UCSI			65467f50-827f-4e4f-8770-dbf4c3f77f45
+	 * TPM2_SERVICE         17b862a4-1806-4faf-86b3-089a58353861
 	 */
 
 	compatible = "arm,ffa-manifest-1.0";
@@ -34,14 +36,16 @@
 	uuid = <0x7ed874e4 0x44403157 0x3ecb27a7 0xdfc8f38c>,
 		   <0x73120c33 0x5747e5fd 0x655b1998 0x02750339>,
 		   <0xdfad5771 0x634cbe2f 0xacef95ae 0x1cb0e316>,
-                   <0x0752cb25 0x7d4236ac 0xa73aefaa 0x7ed27788>,
-		   <0xa76df531 0x724d3c59 0xc78fb3a4 0x73c01a17>;
+		   <0x0752cb25 0x7d4236ac 0xa73aefaa 0x7ed27788>,
+		   <0xa76df531 0x724d3c59 0xc78fb3a4 0x73c01a17>,
+		   <0x507f4665 0x4f4e7f82 0xf4db7087 0x457ff7c3>,
+		   <0xa462b817 0xaf4f0618 0x9a08b386 0x61383558>;
 	id = <0x8002>;
 	execution-ctx-count = <1>;
 	exception-level = <2>; /* SEL1*/
 	execution-state = <0>; /* AArch64*/
-	load-address = <0x0 0x20400000>;
-	entrypoint-offset = <0x10000>;
+	load-address = <0x0 0xE700000>;
+	entrypoint-offset = <0x2000>;
 	image-size = <0x0 0x50000>;
 	xlat-granule = <0>; /* 4KiB */
 	boot-order = <2>;
@@ -61,22 +65,39 @@
 		// Heap used by RUST code in SP
 		heap {
 			description = "heap";
-			base-address = <0x0 0x20500000>;
+			base-address = <0x0 0xE800000>;
 			pages-count = <0x100>; /* 1MB of Heap space */
 			attributes = <0x3>;
 		};
-		
-		/*
-		 * Memory shared between Normal world and S-EL0.
-		 * Similar to ARM_SP_IMAGE_NS_BUF_MMAP.
-		 */
-		ns_comm_buffer {
-			description = "ns-comm";
-			base-address = <0x00000100 0x60000000>;
-			pages-count = <0x800>;
-			attributes = <0xB>;
-		};
-
 	};
 
+	device-regions {
+		compatible = "arm,ffa-manifest-device-regions";
+
+		/* Internal TPM CRB — per-locality shadow registers used by TpmService.
+		 * Placed after the C-based MSSP's internal CRB (0x40200000-0x40205000).
+		 */
+		tpm_internal_crb {
+			description = "internal tpm crb";
+			base-address = <0x00 0x40200000>;
+			pages-count = <0x5>;
+			attributes = <0x3>;
+		};
+
+		/* External TPM CRB — swtpm MMIO registers. */
+		tpm_external_crb {
+			description = "external tpm crb";
+			base-address = <0x0 0x0C000000>;
+			pages-count = <0x5>;
+			attributes = <0x3>;
+		};
+
+		/* EC uart — secure PL011 @ 0x09040000 (the EC MCTP link). */
+		ec_uart {
+			description = "ec uart";
+			base-address = <0x0 0x09040000>;
+			pages-count = <0x1>;
+			attributes = <0x3>;
+		};
+	};
 };

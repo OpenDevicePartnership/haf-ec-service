@@ -18,6 +18,7 @@ aarch64-paging.workspace = true
 aarch64-cpu.workspace = true
 aarch64-haf.workspace = true
 hafnium.workspace = true
+qemu-sp-uart.workspace = true
 
 [dependencies]
 odp-ffa.workspace = true

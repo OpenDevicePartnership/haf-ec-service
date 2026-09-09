@@ -15,29 +15,14 @@
 //! 3. Read a framed response packet back from the transport, MCTP-strip
 //!    it, return the response header + body to the caller.
 //!
-//! This module owns steps 1–3. Per-service SP-side code (e.g.
-//! [`crate::services::battery::Battery`]) defines only the
-//! service-specific bits: service id, message id discriminants,
-//! request/response struct shapes, and `From<&[u8]>` / `Into<Vec<u8>>`
-//! conversions.
+//! This module owns framing, transport I/O, and ODP response-envelope
+//! validation. Per-service shims such as Battery, Thermal, and TimeAlarm
+//! are generic over `R: Relay`; they provide service ids, command ids,
+//! request bodies, and exact response parsers without naming a transport.
 //!
-//! # Transport abstraction
-//!
-//! [`OdpTransport`] decouples the relay framing from the physical wire.
-//! [`MctpSerialTransport`] is the concrete impl for MCTP-via-PL011-UART
-//! used by `qemu-ec-sp`; a hypothetical SmbusEspi transport would
-//! implement the trait identically. Per-service code (`Battery`,
-//! future `Thermal`, etc.) is generic over `T: OdpTransport` and never
-//! sees UART types.
-//!
-//! # Wire-format compatibility
-//!
-//! Bytes produced by [`build_request_header`] + caller-supplied body
-//! are byte-for-byte identical to what
-//! `embedded-services::relay::SerializableMessage::serialize` emits on
-//! the EC side. Drift is caught by the wire-format gate test in
-//! `services::battery::tests` (which round-trips bytes through the EC's
-//! OWN `SerializableMessage` impl).
+//! Bytes produced by [`build_odp_header`] plus each caller's request body
+//! are checked by per-service host wire-format tests against the EC's own
+//! `SerializableMessage` implementations.
 
 use mctp_rs::{
     EndpointId, MctpMedium, MctpMessageHeaderTrait, MctpMessageTag, MctpMessageTrait, MctpPacketContext,
@@ -62,8 +47,10 @@ pub const ODP_MESSAGE_TYPE: u8 = 0x7D;
 /// |--------|-------------|----------|-------------|
 /// | is_req | service_id  | is_error | message_id  |
 ///
-/// `is_error` is always 0 (only success responses are produced
-/// by the EC mock services we proxy to).
+/// This helper constructs SP requests and synthetic success responses.
+/// EC error responses set `is_error` and use the service error
+/// discriminant as `message_id`; host tests construct those with
+/// `test_util::build_odp_error_header`.
 pub fn build_odp_header(is_request: bool, service_id: u8, message_id: u16) -> [u8; 4] {
     let mut raw: u32 = 0;
     if is_request {
@@ -85,6 +72,29 @@ pub fn parse_odp_header(bytes: &[u8]) -> Result<(bool, u8, bool, u16), &'static 
     let is_error = (raw & (1 << 15)) != 0;
     let message_id = (raw & 0x7FFF) as u16;
     Ok((is_request, service_id, is_error, message_id))
+}
+
+/// Split the first `N` bytes off `body` as an owned array, returning the
+/// remaining bytes for chained reads, or [`EcRelayError::BodyTooShort`].
+/// `N` is inferred from the caller (e.g. `u32::from_le_bytes` fixes it at
+/// 4), so a command's response length stays derived from its parse rather
+/// than a separate constant that can drift.
+pub fn take_array<const N: usize>(body: &[u8]) -> Result<([u8; N], &[u8]), EcRelayError> {
+    let (head, rest) = body.split_first_chunk::<N>().ok_or(EcRelayError::BodyTooShort)?;
+    Ok((*head, rest))
+}
+
+/// Convert an exact-length response body into an owned array.
+///
+/// New fixed-size service parsers use this rather than silently accepting
+/// a trailing suffix.
+pub fn take_exact_array<const N: usize>(body: &[u8]) -> Result<[u8; N], EcRelayError> {
+    let (exact, rest) = take_array(body)?;
+    if rest.is_empty() {
+        Ok(exact)
+    } else {
+        Err(EcRelayError::BodyTooLong)
+    }
 }
 
 // ===========================================================================
@@ -151,6 +161,9 @@ pub enum EcRelayError {
     TransportWrite,
     /// Transport-layer read failure (UART RX timeout, etc.).
     TransportRead,
+    /// Read budget exhausted before a framed response arrived. Distinct
+    /// from `TransportRead` so callers can fail deterministically.
+    TransportReadTimeout,
     /// `MctpPacketContext::serialize_packet` failed.
     MctpSerialize(&'static str),
     /// Bytes received from transport could not be parsed as a complete
@@ -162,12 +175,19 @@ pub enum EcRelayError {
     MctpRecvIncomplete,
     /// Response packet's MCTP message-type byte was not [`ODP_MESSAGE_TYPE`].
     UnexpectedMessageType,
-    /// Response ODP header had an unexpected service-id or message-id.
+    /// Response ODP header had an unexpected service id or a
+    /// successful-response message id.
     UnexpectedOdpService,
     /// Response packet's OdpHeader could not be parsed.
     OdpHeaderParse(&'static str),
+    /// Response packet was marked as an ODP request.
+    UnexpectedOdpRequest,
+    /// EC service returned an error; the value is its error discriminant.
+    Remote(u16),
     /// Response body was shorter than the per-service expected length.
     BodyTooShort,
+    /// Response body was longer than the per-service expected length.
+    BodyTooLong,
 }
 
 /// Transport-agnostic packet I/O. An [`OdpTransport`] knows how to:
@@ -220,9 +240,14 @@ impl<U: embedded_io::Read + embedded_io::Write> OdpTransport for MctpSerialTrans
                 return Err(EcRelayError::MctpRecvIncomplete);
             }
             let mut byte = [0u8; 1];
-            self.uart
-                .read_exact(&mut byte)
-                .map_err(|_| EcRelayError::TransportRead)?;
+            self.uart.read_exact(&mut byte).map_err(|e| match e {
+                embedded_io::ReadExactError::Other(inner)
+                    if embedded_io::Error::kind(&inner) == embedded_io::ErrorKind::TimedOut =>
+                {
+                    EcRelayError::TransportReadTimeout
+                }
+                _ => EcRelayError::TransportRead,
+            })?;
             buf[filled] = byte[0];
             filled += 1;
             if byte[0] == SERIAL_END_FLAG {
@@ -240,7 +265,6 @@ impl<U: embedded_io::Read + embedded_io::Write> OdpTransport for MctpSerialTrans
 ///
 /// Body lifetime is bounded by the closure call in [`invoke`]. Parse
 /// inside the closure; only owned values can escape.
-#[allow(dead_code)] // is_request + is_error are exposed for future callers
 pub struct OdpResponse<'b> {
     pub is_request: bool,
     pub service_id: u8,
@@ -276,6 +300,52 @@ pub trait Relay {
     ) -> Result<R, EcRelayError>
     where
         F: FnOnce(OdpResponse<'_>) -> Result<R, EcRelayError>;
+
+    /// Build a request and validate a success response whose discriminant is
+    /// the same as the request message id.
+    fn invoke_request<R, F>(
+        &mut self,
+        service_id: u8,
+        message_id: u16,
+        request_body: &[u8],
+        parse_body: F,
+    ) -> Result<R, EcRelayError>
+    where
+        F: FnOnce(&[u8]) -> Result<R, EcRelayError>,
+    {
+        self.invoke_request_with_response_id(service_id, message_id, message_id, request_body, parse_body)
+    }
+
+    /// Build a request and validate a success response with an explicit
+    /// response discriminant before parsing its body.
+    fn invoke_request_with_response_id<R, F>(
+        &mut self,
+        service_id: u8,
+        request_message_id: u16,
+        expected_response_message_id: u16,
+        request_body: &[u8],
+        parse_body: F,
+    ) -> Result<R, EcRelayError>
+    where
+        F: FnOnce(&[u8]) -> Result<R, EcRelayError>,
+    {
+        let request_header = build_odp_header(true, service_id, request_message_id);
+        self.invoke(request_header, request_body, |response| {
+            if response.is_request {
+                return Err(EcRelayError::UnexpectedOdpRequest);
+            }
+            if response.service_id != service_id {
+                return Err(EcRelayError::UnexpectedOdpService);
+            }
+            if response.is_error {
+                return Err(EcRelayError::Remote(response.message_id));
+            }
+            if response.message_id != expected_response_message_id {
+                return Err(EcRelayError::UnexpectedOdpService);
+            }
+            parse_body(response.body)
+        })
+    }
 }
 
 /// Owning relay handle to the EC firmware over an `OdpTransport`. Owns
@@ -365,7 +435,7 @@ impl<T: OdpTransport> Relay for EcRelay<T> {
         }
 
         // ----- 2. Read one framed packet back into a small RX buffer.
-        let mut rx_packet = [0u8; 64];
+        let mut rx_packet = [0u8; 256];
         let rx_len = self.transport.recv_framed_packet(&mut rx_packet)?;
 
         // ----- 3. MCTP-strip via a fresh PacketContext borrowing
@@ -457,6 +527,19 @@ pub(crate) mod test_util {
         }
     }
 
+    /// Strip MCTP framing; returns the inner body (ODP header + payload).
+    pub fn strip_mctp_framing(framed: &[u8]) -> Vec<u8> {
+        use mctp_rs::{MctpPacketContext, MctpSerialMedium};
+        let mut buf = [0u8; 256];
+        let mut ctx = MctpPacketContext::<MctpSerialMedium>::new(MctpSerialMedium, &mut buf);
+        let message = ctx
+            .deserialize_packet(framed)
+            .expect("deserialize_packet ok")
+            .expect("complete message");
+        assert_eq!(message.message_buffer.message_type(), ODP_MESSAGE_TYPE);
+        message.message_buffer.body().to_vec()
+    }
+
     impl OdpTransport for LoopbackTransport {
         fn send_packet(&mut self, packet: &[u8]) -> Result<(), EcRelayError> {
             self.tx.extend_from_slice(packet);
@@ -478,6 +561,54 @@ pub(crate) mod test_util {
                 }
             }
         }
+    }
+
+    /// Test UART that always reports a timed-out read.
+    pub struct TimeoutUart;
+
+    impl embedded_io::ErrorType for TimeoutUart {
+        type Error = TimeoutUartErr;
+    }
+
+    #[derive(Debug)]
+    pub struct TimeoutUartErr;
+
+    impl embedded_io::Error for TimeoutUartErr {
+        fn kind(&self) -> embedded_io::ErrorKind {
+            embedded_io::ErrorKind::TimedOut
+        }
+    }
+
+    impl core::fmt::Display for TimeoutUartErr {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "timeout")
+        }
+    }
+
+    impl core::error::Error for TimeoutUartErr {}
+
+    impl embedded_io::Read for TimeoutUart {
+        fn read(&mut self, _buf: &mut [u8]) -> Result<usize, Self::Error> {
+            Err(TimeoutUartErr)
+        }
+    }
+
+    impl embedded_io::Write for TimeoutUart {
+        fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+            // Swallow writes so tests reach the RX timeout path
+            // (`write_all` panics on `Ok(0)`).
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    /// Build a 4-byte BE OdpHeader for a synthetic EC error response:
+    /// `is_error` set, with `error_code` in the message-id field.
+    pub fn build_odp_error_header(service_id: u8, error_code: u16) -> [u8; 4] {
+        let raw = ((service_id as u32) << 16) | (1 << 15) | (u32::from(error_code) & 0x7FFF);
+        raw.to_be_bytes()
     }
 
     /// Helper used by per-service tests: synthesize a framed response
@@ -525,5 +656,81 @@ mod tests {
     #[test]
     fn parse_odp_header_rejects_short_buffer() {
         assert!(parse_odp_header(&[0x02, 0x08, 0x00]).is_err());
+    }
+
+    #[test]
+    fn recv_framed_packet_maps_timed_out_kind_to_transport_read_timeout() {
+        use test_util::TimeoutUart;
+        let mut t = MctpSerialTransport::new(TimeoutUart);
+        let mut buf = [0u8; 64];
+        let err = t.recv_framed_packet(&mut buf).expect_err("timeout should surface");
+        assert_eq!(err, EcRelayError::TransportReadTimeout);
+    }
+
+    #[test]
+    fn take_exact_array_accepts_exact_body() {
+        assert_eq!(take_exact_array::<4>(&[1, 2, 3, 4]), Ok([1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn take_exact_array_rejects_short_body() {
+        assert_eq!(take_exact_array::<4>(&[1, 2, 3]), Err(EcRelayError::BodyTooShort));
+    }
+
+    #[test]
+    fn take_exact_array_rejects_trailing_body() {
+        assert_eq!(take_exact_array::<4>(&[1, 2, 3, 4, 5]), Err(EcRelayError::BodyTooLong));
+    }
+
+    #[test]
+    fn invoke_request_with_response_id_rejects_wrong_success_id() {
+        let header = build_odp_header(false, 0x0B, 7);
+        let framed = test_util::frame_response_packets(header, &300u32.to_le_bytes());
+        let mut transport = test_util::LoopbackTransport::new();
+        transport.prime_rx(framed.iter().copied());
+        let mut relay = EcRelay::new(transport);
+
+        let result = relay.invoke_request_with_response_id(0x0B, 7, 5, &[], |_| Ok(()));
+
+        assert_eq!(result, Err(EcRelayError::UnexpectedOdpService));
+    }
+
+    #[test]
+    fn invoke_request_with_response_id_preserves_remote_error() {
+        let header = test_util::build_odp_error_header(0x0B, 1);
+        let framed = test_util::frame_response_packets(header, &[]);
+        let mut transport = test_util::LoopbackTransport::new();
+        transport.prime_rx(framed.iter().copied());
+        let mut relay = EcRelay::new(transport);
+
+        let result = relay.invoke_request_with_response_id(0x0B, 7, 5, &[], |_| Ok(()));
+
+        assert_eq!(result, Err(EcRelayError::Remote(1)));
+    }
+
+    #[test]
+    fn invoke_request_preserves_remote_error_code() {
+        let header = test_util::build_odp_error_header(0x09, 1);
+        let framed = test_util::frame_response_packets(header, &[]);
+        let mut transport = test_util::LoopbackTransport::new();
+        transport.prime_rx(framed.iter().copied());
+        let mut relay = EcRelay::new(transport);
+
+        let result = relay.invoke_request(0x09, 4, &[], |_| Ok(()));
+
+        assert_eq!(result, Err(EcRelayError::Remote(1)));
+    }
+
+    #[test]
+    fn invoke_request_rejects_response_marked_as_request() {
+        let header = build_odp_header(true, 0x09, 4);
+        let framed = test_util::frame_response_packets(header, &[]);
+        let mut transport = test_util::LoopbackTransport::new();
+        transport.prime_rx(framed.iter().copied());
+        let mut relay = EcRelay::new(transport);
+
+        let result = relay.invoke_request(0x09, 4, &[], |_| Ok(()));
+
+        assert_eq!(result, Err(EcRelayError::UnexpectedOdpRequest));
     }
 }

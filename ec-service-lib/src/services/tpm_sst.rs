@@ -177,7 +177,7 @@ pub trait TpmSstOps {
     fn locality_request(&mut self, locality: u8) -> ErrorCode;
     fn locality_relinquish(&mut self, locality: u8) -> ErrorCode;
     fn is_idle_bypass_supported(&self) -> bool;
-    fn init(&mut self, tpm_crb_address: u64);
+    fn init(&mut self);
 }
 
 // ---------------------------------------------------------------------------
@@ -191,7 +191,7 @@ pub struct TpmSst {
 
 impl Default for TpmSst {
     fn default() -> Self {
-        Self::new()
+        Self::new(0x0)
     }
 }
 
@@ -200,13 +200,12 @@ impl Default for TpmSst {
 //       a CRB or FIFO interface. The mechanism to read/write to these addresses are
 //       inherently unsafe functions as they require pointers to manipulate the memory.
 impl TpmSst {
-    // Creates an uninitialized `TpmSst`. Call [`TpmSstOps::init()`] before use. Init
-    // will initialize the internal variables.
-    pub fn new() -> Self {
+    // Creates a `TpmSst` bound to the external CRB/FIFO MMIO base address.
+    pub fn new(tpm_crb_address: u64) -> Self {
         Self {
             is_crb_interface: false,
             is_idle_bypass_supported: false,
-            tpm_crb_address: 0x60120000,
+            tpm_crb_address,
         }
     }
 
@@ -680,10 +679,7 @@ impl TpmSstOps for TpmSst {
     // Initializes the TPM Service State Translation Library by reading the
     // interface identifier register to determine the TPM interface type and
     // idle bypass support.
-    fn init(&mut self, tpm_crb_address: u64) {
-        // Set the tpm CRB address.
-        self.tpm_crb_address = tpm_crb_address;
-
+    fn init(&mut self) {
         // Note that the register we are looking at are located at the same address
         // regardless of if the TPM type is FIFO or CRB.
         let external_crb = self.tpm_crb_address as *const PtpCrbRegisters;
@@ -837,15 +833,15 @@ mod tests {
     // ===================================================================
     #[test]
     fn test_tpm_sst_new_defaults() {
-        let sst = TpmSst::new();
+        let sst = TpmSst::new(0x0);
         assert!(!sst.is_crb_interface);
         assert!(!sst.is_idle_bypass_supported);
-        assert_eq!(sst.tpm_crb_address, 0x60120000);
+        assert_eq!(sst.tpm_crb_address, 0x0);
     }
 
     #[test]
     fn test_tpm_sst_new_equals_default() {
-        let tpm_new = TpmSst::new();
+        let tpm_new = TpmSst::new(0x0);
         let tpm_default = TpmSst::default();
         assert_eq!(tpm_new.is_crb_interface, tpm_default.is_crb_interface);
         assert_eq!(tpm_new.is_idle_bypass_supported, tpm_default.is_idle_bypass_supported);
@@ -873,8 +869,8 @@ mod tests {
     #[test]
     fn test_crb_ptr_equals_fifo_ptr() {
         let (buff, addr) = alloc_crb_region();
-        let mut sst = TpmSst::new();
-        sst.init(addr);
+        let mut sst = TpmSst::new(addr);
+        sst.init();
         assert_eq!(sst.external_crb_ptr(0) as *mut u8, sst.external_fifo_ptr(0) as *mut u8);
         assert_eq!(sst.external_crb_ptr(1) as *mut u8, sst.external_fifo_ptr(1) as *mut u8);
         assert_eq!(sst.external_crb_ptr(2) as *mut u8, sst.external_fifo_ptr(2) as *mut u8);
@@ -897,8 +893,8 @@ mod tests {
             ptr::write_volatile(ptr::addr_of!((*crb).interface_id) as *mut u32, 0x00);
         }
 
-        let mut sst = TpmSst::new();
-        sst.init(addr);
+        let mut sst = TpmSst::new(addr);
+        sst.init();
         assert!(!sst.is_crb_interface);
     }
 
@@ -914,8 +910,8 @@ mod tests {
             ptr::write_volatile(ptr::addr_of!((*crb).interface_id) as *mut u32, 0x01);
         }
 
-        let mut sst = TpmSst::new();
-        sst.init(addr);
+        let mut sst = TpmSst::new(addr);
+        sst.init();
         assert!(sst.is_crb_interface);
     }
 
@@ -931,8 +927,8 @@ mod tests {
             ptr::write_volatile(ptr::addr_of!((*crb).interface_id) as *mut u32, 0x00);
         }
 
-        let mut sst = TpmSst::new();
-        sst.init(addr);
+        let mut sst = TpmSst::new(addr);
+        sst.init();
         assert!(!sst.is_idle_bypass_supported);
     }
 
@@ -948,8 +944,8 @@ mod tests {
             ptr::write_volatile(ptr::addr_of!((*crb).interface_id) as *mut u32, 0x200);
         }
 
-        let mut sst = TpmSst::new();
-        sst.init(addr);
+        let mut sst = TpmSst::new(addr);
+        sst.init();
         assert!(sst.is_idle_bypass_supported);
     }
 
@@ -971,8 +967,8 @@ mod tests {
             ptr::write_volatile(ptr::addr_of!((*crb).interface_id) as *mut u32, 0x01);
         }
 
-        let mut sst = TpmSst::new();
-        sst.init(addr);
+        let mut sst = TpmSst::new(addr);
+        sst.init();
         assert!(sst.is_crb_interface);
 
         unsafe {
@@ -1001,8 +997,8 @@ mod tests {
             ptr::write_volatile(ptr::addr_of!((*crb).interface_id) as *mut u32, 0x01);
         }
 
-        let mut sst = TpmSst::new();
-        sst.init(addr);
+        let mut sst = TpmSst::new(addr);
+        sst.init();
         assert!(sst.is_crb_interface);
 
         unsafe {
@@ -1023,8 +1019,8 @@ mod tests {
             ptr::write_volatile(ptr::addr_of!((*crb).interface_id) as *mut u32, 0x01);
         }
 
-        let mut sst = TpmSst::new();
-        sst.init(addr);
+        let mut sst = TpmSst::new(addr);
+        sst.init();
         assert!(sst.is_crb_interface);
 
         unsafe {
@@ -1058,8 +1054,8 @@ mod tests {
             ptr::write_volatile(ptr::addr_of!((*crb).interface_id) as *mut u32, 0x01);
         }
 
-        let mut sst = TpmSst::new();
-        sst.init(addr);
+        let mut sst = TpmSst::new(addr);
+        sst.init();
         assert!(sst.is_crb_interface);
 
         unsafe {
@@ -1094,8 +1090,8 @@ mod tests {
             ptr::write_volatile(ptr::addr_of!((*crb).interface_id) as *mut u32, 0x01);
         }
 
-        let mut sst = TpmSst::new();
-        sst.init(addr);
+        let mut sst = TpmSst::new(addr);
+        sst.init();
         assert!(sst.is_crb_interface);
 
         unsafe {
@@ -1129,8 +1125,8 @@ mod tests {
             ptr::write_volatile(ptr::addr_of!((*crb).interface_id) as *mut u32, 0x01);
         }
 
-        let mut sst = TpmSst::new();
-        sst.init(addr);
+        let mut sst = TpmSst::new(addr);
+        sst.init();
         assert!(sst.is_crb_interface);
 
         unsafe {
@@ -1151,8 +1147,8 @@ mod tests {
             ptr::write_volatile(ptr::addr_of!((*crb).interface_id) as *mut u32, 0x01);
         }
 
-        let mut sst = TpmSst::new();
-        sst.init(addr);
+        let mut sst = TpmSst::new(addr);
+        sst.init();
         assert!(sst.is_crb_interface);
 
         unsafe {
@@ -1191,8 +1187,8 @@ mod tests {
             ptr::write_volatile(ptr::addr_of!((*crb).interface_id) as *mut u32, 0x01);
         }
 
-        let mut sst = TpmSst::new();
-        sst.init(addr);
+        let mut sst = TpmSst::new(addr);
+        sst.init();
         assert!(sst.is_crb_interface);
 
         unsafe {
