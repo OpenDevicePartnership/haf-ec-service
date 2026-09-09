@@ -1,0 +1,19 @@
+[book]
+authors = ["Open Device Partnership"]
+language = "en"
+src = "src"
+title = "ODP Secure Services"
+
+[build]
+build-dir = "book"
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
+[output.html]
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
+git-repository-url = "https://github.com/OpenDevicePartnership/odp-secure-services"
+edit-url-template = "https://github.com/OpenDevicePartnership/odp-secure-services/edit/main/docs/{path}"
+
+[output.html.fold]
+enable = true

@@ -1,0 +1,64 @@
+name: Documentation
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build mdBook
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install mdBook
+        run: cargo install mdbook --version 0.5.4 --locked
+
+      - name: Install mdbook-mermaid
+        run: cargo install mdbook-mermaid --version 0.17.1 --locked
+
+      - name: Build documentation
+        run: mdbook build docs
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: docs/book
+
+  deploy:
+    name: Deploy GitHub Pages
+    if: github.event_name == 'push' && github.repository_owner == 'OpenDevicePartnership'
+    needs: build
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+      pages: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
