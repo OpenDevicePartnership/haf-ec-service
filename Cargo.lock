@@ -280,6 +280,7 @@ dependencies = [
  "aarch64-cpu",
  "battery-service-interface",
  "battery-service-relay",
+ "critical-section",
  "embedded-io",
  "embedded-services",
  "embedded-usb-pd",

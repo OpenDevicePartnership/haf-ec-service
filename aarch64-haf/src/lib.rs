@@ -3,6 +3,7 @@
 #[cfg(target_os = "none")]
 pub mod interrupt;
 
+#[cfg(target_os = "none")]
 mod critical_section;
 
 #[cfg(target_os = "none")]

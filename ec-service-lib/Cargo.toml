@@ -42,6 +42,9 @@ time-alarm-service-interface.workspace = true
 # tests in services/ucsi.rs. Never a runtime dep (the SP hand-encodes bytes).
 embedded-usb-pd.workspace = true
 
+[target.'cfg(not(target_os = "none"))'.dev-dependencies]
+critical-section = { workspace = true, features = ["std"] }
+
 [features]
 default = []
 test-bypass-locality-check = []

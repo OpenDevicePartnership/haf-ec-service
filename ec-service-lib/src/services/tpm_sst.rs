@@ -73,6 +73,35 @@ pub const PTP_TIMEOUT_MAX: u64 = 90000 * 1000; // 90s
 // PTP CRB Registers
 // ---------------------------------------------------------------------------
 pub const CRB_DATA_BUFFER_SIZE: usize = 0xF80;
+const TPM_HEADER_SIZE: usize = 10;
+
+fn tpm_packet_length(header: &[u8], capacity: usize) -> Result<usize, ErrorCode> {
+    let header = header.get(..TPM_HEADER_SIZE).ok_or(ErrorCode::InvalidParameters)?;
+    let length = u32::from_be_bytes([header[2], header[3], header[4], header[5]]) as usize;
+    if !(TPM_HEADER_SIZE..=CRB_DATA_BUFFER_SIZE).contains(&capacity) || !(TPM_HEADER_SIZE..=capacity).contains(&length)
+    {
+        return Err(ErrorCode::InvalidParameters);
+    }
+    Ok(length)
+}
+
+fn read_tpm_response(
+    buffer: &mut [u8],
+    mut read_byte: impl FnMut(usize) -> Result<u8, ErrorCode>,
+) -> Result<usize, ErrorCode> {
+    if !(TPM_HEADER_SIZE..=CRB_DATA_BUFFER_SIZE).contains(&buffer.len()) {
+        return Err(ErrorCode::InvalidParameters);
+    }
+    for (offset, byte) in buffer[..TPM_HEADER_SIZE].iter_mut().enumerate() {
+        *byte = read_byte(offset)?;
+    }
+    let length = tpm_packet_length(buffer, buffer.len())?;
+    for (offset, byte) in buffer.iter_mut().enumerate().take(length).skip(TPM_HEADER_SIZE) {
+        *byte = read_byte(offset)?;
+    }
+    Ok(length)
+}
+
 #[repr(C, packed)]
 pub struct PtpCrbRegisters {
     pub locality_state: u32,                         // 0x00
@@ -365,51 +394,32 @@ impl TpmSst {
     // SAFETY: Function copies data from the external CRB/FIFO to the internal CRB. This
     //         function, in the FIFO instance, also calls fifo_read_burst_count which is
     //         also marked as unsafe.
-    unsafe fn copy_response_data(
-        &self,
-        locality: u8,
-        tpm_command_buffer: &mut [u8],
-        response_data_len: u32,
-    ) -> ErrorCode {
+    unsafe fn copy_response_data(&self, locality: u8, tpm_command_buffer: &mut [u8]) -> Result<usize, ErrorCode> {
         // Determine which TPM structure to access.
         if self.is_crb_interface {
             let external_crb = self.external_crb_ptr(locality);
 
             // Copy the CRB buffer data to the response buffer.
-            #[allow(clippy::needless_range_loop)]
-            for i in 0..(response_data_len as usize) {
-                tpm_command_buffer[i] = ptr::read_volatile(ptr::addr_of!((*external_crb).crb_data_buffer[i]));
-            }
-
-            ErrorCode::Ok
+            read_tpm_response(tpm_command_buffer, |offset| {
+                Ok(ptr::read_volatile(ptr::addr_of!(
+                    (*external_crb).crb_data_buffer[offset]
+                )))
+            })
         } else {
             let external_fifo = self.external_fifo_ptr(locality);
-            let mut status = ErrorCode::Ok;
-            let len = response_data_len as usize;
+            let mut remaining_burst = 0;
 
-            let mut index: usize = 0;
-            while index < len {
-                let burst_count = match self.fifo_read_burst_count(external_fifo) {
-                    Ok(bc) => bc,
-                    Err(error) => {
-                        status = error;
-                        break;
-                    }
-                };
-
-                let mut remaining_burst = burst_count;
-                while remaining_burst > 0 {
-                    tpm_command_buffer[index] =
-                        ptr::read_volatile(ptr::addr_of!((*external_fifo).data_fifo) as *mut u8);
-                    index += 1;
-                    remaining_burst -= 1;
-                    if index == len {
-                        return ErrorCode::Ok;
-                    }
+            read_tpm_response(tpm_command_buffer, |_offset| {
+                if remaining_burst == 0 {
+                    remaining_burst = self.fifo_read_burst_count(external_fifo)?;
                 }
-            }
-
-            status
+                if ptr::read_volatile(ptr::addr_of!((*external_fifo).status)) & PTP_FIFO_STS_DATA as u8 == 0 {
+                    return Err(ErrorCode::Denied);
+                }
+                let byte = ptr::read_volatile(ptr::addr_of!((*external_fifo).data_fifo) as *mut u8);
+                remaining_burst -= 1;
+                Ok(byte)
+            })
         }
     }
 }
@@ -528,8 +538,13 @@ impl TpmSstOps for TpmSst {
     // to the external TPM, executes the command, and copies the response back.
     fn start(&mut self, locality: u8, internal_tpm_crb: *mut PtpCrbRegisters) -> ErrorCode {
         unsafe {
-            let response_data_len = (*internal_tpm_crb).crb_control_response_size;
-            let command_data_len = (*internal_tpm_crb).crb_control_command_size;
+            let response_capacity = (*internal_tpm_crb).crb_control_response_size as usize;
+            let command_capacity = (*internal_tpm_crb).crb_control_command_size as usize;
+            if !(TPM_HEADER_SIZE..=CRB_DATA_BUFFER_SIZE).contains(&command_capacity)
+                || !(TPM_HEADER_SIZE..=CRB_DATA_BUFFER_SIZE).contains(&response_capacity)
+            {
+                return ErrorCode::InvalidParameters;
+            }
 
             let mut tpm_command_buffer = [0u8; CRB_DATA_BUFFER_SIZE];
 
@@ -537,16 +552,25 @@ impl TpmSstOps for TpmSst {
             ptr::copy_nonoverlapping(
                 (*internal_tpm_crb).crb_data_buffer.as_ptr(),
                 tpm_command_buffer.as_mut_ptr(),
-                command_data_len as usize,
+                TPM_HEADER_SIZE,
+            );
+            let command_data_len = match tpm_packet_length(&tpm_command_buffer, command_capacity) {
+                Ok(length) => length,
+                Err(error) => return error,
+            };
+            ptr::copy_nonoverlapping(
+                (*internal_tpm_crb).crb_data_buffer.as_ptr().add(TPM_HEADER_SIZE),
+                tpm_command_buffer.as_mut_ptr().add(TPM_HEADER_SIZE),
+                command_data_len - TPM_HEADER_SIZE,
             );
 
             // Debug printout for input data
             if DEBUG_ENABLED {
-                dump_tpm_input_block(command_data_len, &tpm_command_buffer[..command_data_len as usize]);
+                dump_tpm_input_block(command_data_len as u32, &tpm_command_buffer[..command_data_len]);
             }
 
             // Copy the command data to the external TPM.
-            let mut status = self.copy_command_data(locality, &tpm_command_buffer, command_data_len);
+            let mut status = self.copy_command_data(locality, &tpm_command_buffer, command_data_len as u32);
 
             if status != ErrorCode::Ok {
                 return status;
@@ -559,21 +583,22 @@ impl TpmSstOps for TpmSst {
             }
 
             // Copy the response data from the external TPM.
-            status = self.copy_response_data(locality, &mut tpm_command_buffer, response_data_len);
-            if status != ErrorCode::Ok {
-                return status;
-            }
+            let response_data_len =
+                match self.copy_response_data(locality, &mut tpm_command_buffer[..response_capacity]) {
+                    Ok(length) => length,
+                    Err(error) => return error,
+                };
 
             // Copy the CRB response data from the local buffer.
             ptr::copy_nonoverlapping(
                 tpm_command_buffer.as_ptr(),
                 (*internal_tpm_crb).crb_data_buffer.as_mut_ptr(),
-                response_data_len as usize,
+                response_data_len,
             );
 
             // Debug printout for output data
             if DEBUG_ENABLED {
-                dump_tpm_output_block(response_data_len, &tpm_command_buffer[..response_data_len as usize]);
+                dump_tpm_output_block(response_data_len as u32, &tpm_command_buffer[..response_data_len]);
             }
 
             status
@@ -706,6 +731,101 @@ mod tests {
         };
         let addr = region.data.as_ptr() as u64;
         (region, addr)
+    }
+
+    #[test]
+    fn test_packet_length_uses_header_not_capacity() {
+        let header = [0x80, 0x02, 0, 0, 0, 65, 0, 0, 0x01, 0x82];
+        assert_eq!(tpm_packet_length(&header, CRB_DATA_BUFFER_SIZE), Ok(65));
+    }
+
+    #[test]
+    fn test_packet_length_accepts_boundaries() {
+        for length in [TPM_HEADER_SIZE, CRB_DATA_BUFFER_SIZE] {
+            let mut header = [0u8; TPM_HEADER_SIZE];
+            header[2..6].copy_from_slice(&(length as u32).to_be_bytes());
+            assert_eq!(tpm_packet_length(&header, length), Ok(length));
+        }
+    }
+
+    #[test]
+    fn test_packet_length_rejects_invalid_lengths() {
+        for length in [0, 9, 66, u32::MAX] {
+            let mut header = [0u8; TPM_HEADER_SIZE];
+            header[2..6].copy_from_slice(&length.to_be_bytes());
+            assert_eq!(tpm_packet_length(&header, 65), Err(ErrorCode::InvalidParameters));
+        }
+    }
+
+    #[test]
+    fn test_packet_length_rejects_invalid_capacity_or_short_header() {
+        let header = [0x80, 0x01, 0, 0, 0, 10, 0, 0, 0x01, 0x01];
+        for capacity in [0, 9, CRB_DATA_BUFFER_SIZE + 1] {
+            assert_eq!(tpm_packet_length(&header, capacity), Err(ErrorCode::InvalidParameters));
+        }
+        assert_eq!(tpm_packet_length(&header[..9], 65), Err(ErrorCode::InvalidParameters));
+    }
+
+    #[test]
+    fn test_read_response_stops_at_packet_length() {
+        for length in [TPM_HEADER_SIZE, 19, CRB_DATA_BUFFER_SIZE] {
+            let mut packet = std::vec![0x5a; length];
+            packet[..2].copy_from_slice(&[0x80, 0x01]);
+            packet[2..6].copy_from_slice(&(length as u32).to_be_bytes());
+            let mut fifo = std::collections::VecDeque::from(packet.clone());
+            fifo.extend([0xee; 8]);
+            let mut buffer = [0xcc; CRB_DATA_BUFFER_SIZE];
+            let mut reads = 0;
+
+            let result = read_tpm_response(&mut buffer, |offset| {
+                assert_eq!(offset, reads);
+                reads += 1;
+                fifo.pop_front().ok_or(ErrorCode::Denied)
+            });
+
+            assert_eq!(result, Ok(length));
+            assert_eq!(reads, length);
+            assert_eq!(fifo.len(), 8);
+            assert_eq!(&buffer[..length], packet.as_slice());
+            assert!(buffer[length..].iter().all(|byte| *byte == 0xcc));
+        }
+    }
+
+    #[test]
+    fn test_read_response_rejects_bad_lengths_before_reading_payload() {
+        for length in [0, 9, 20, u32::MAX] {
+            let mut header = [0u8; TPM_HEADER_SIZE];
+            header[2..6].copy_from_slice(&length.to_be_bytes());
+            let mut buffer = [0xcc; 19];
+            let mut reads = 0;
+            let result = read_tpm_response(&mut buffer, |offset| {
+                reads += 1;
+                Ok(header[offset])
+            });
+            assert_eq!(result, Err(ErrorCode::InvalidParameters));
+            assert_eq!(reads, TPM_HEADER_SIZE);
+            assert!(buffer[TPM_HEADER_SIZE..].iter().all(|byte| *byte == 0xcc));
+        }
+    }
+
+    #[test]
+    fn test_read_response_rejects_invalid_capacity_without_reading() {
+        for capacity in [0, 9, CRB_DATA_BUFFER_SIZE + 1] {
+            let mut buffer = std::vec![0; capacity];
+            let result = read_tpm_response(&mut buffer, |_offset| panic!("unexpected TPM read"));
+            assert_eq!(result, Err(ErrorCode::InvalidParameters));
+        }
+    }
+
+    #[test]
+    fn test_read_response_propagates_header_and_payload_read_errors() {
+        let packet = [0x80, 0x02, 0, 0, 0, 19, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        for available in [0, 9, 10, 18] {
+            let mut fifo = packet[..available].iter().copied();
+            let mut buffer = [0; CRB_DATA_BUFFER_SIZE];
+            let result = read_tpm_response(&mut buffer, |_offset| fifo.next().ok_or(ErrorCode::Denied));
+            assert_eq!(result, Err(ErrorCode::Denied));
+        }
     }
 
     // ===================================================================
@@ -975,20 +1095,21 @@ mod tests {
         assert!(sst.is_crb_interface);
 
         unsafe {
-            let test_data: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
+            let test_data = [0x80, 0x01, 0, 0, 0, 14, 0, 0, 0, 0, 0xDE, 0xAD, 0xBE, 0xEF];
             let crb = sst.external_crb_ptr(0);
             #[allow(clippy::needless_range_loop)]
-            for i in 0..4 {
-                ptr::write_volatile(ptr::addr_of!((*crb).crb_data_buffer[i]) as *mut u8, test_data[i]);
+            for index in 0..test_data.len() {
+                ptr::write_volatile(
+                    ptr::addr_of!((*crb).crb_data_buffer[index]) as *mut u8,
+                    test_data[index],
+                );
             }
 
-            let mut resp_data = [0u8; 4];
-            let status = sst.copy_response_data(0, &mut resp_data, 4);
-            assert_eq!(status, ErrorCode::Ok);
-
-            for i in 0..4 {
-                assert_eq!(resp_data[i], test_data[i]);
-            }
+            let mut resp_data = [0xcc; CRB_DATA_BUFFER_SIZE];
+            let result = sst.copy_response_data(0, &mut resp_data);
+            assert_eq!(result, Ok(test_data.len()));
+            assert_eq!(&resp_data[..test_data.len()], &test_data);
+            assert!(resp_data[test_data.len()..].iter().all(|byte| *byte == 0xcc));
         }
     }
 
@@ -1009,8 +1130,8 @@ mod tests {
         assert!(sst.is_crb_interface);
 
         unsafe {
-            let status = sst.copy_response_data(0, &mut [], 0);
-            assert_eq!(status, ErrorCode::Ok);
+            let result = sst.copy_response_data(0, &mut []);
+            assert_eq!(result, Err(ErrorCode::InvalidParameters));
         }
     }
 
@@ -1033,15 +1154,21 @@ mod tests {
         unsafe {
             let mut test_data = [0u8; CRB_DATA_BUFFER_SIZE];
             let crb = sst.external_crb_ptr(0);
+            for (index, byte) in test_data.iter_mut().enumerate() {
+                *byte = (index & 0xFF) as u8;
+            }
+            test_data[2..6].copy_from_slice(&(CRB_DATA_BUFFER_SIZE as u32).to_be_bytes());
             #[allow(clippy::needless_range_loop)]
-            for i in 0..CRB_DATA_BUFFER_SIZE {
-                test_data[i] = (i & 0xFF) as u8;
-                ptr::write_volatile(ptr::addr_of!((*crb).crb_data_buffer[i]) as *mut u8, test_data[i]);
+            for index in 0..CRB_DATA_BUFFER_SIZE {
+                ptr::write_volatile(
+                    ptr::addr_of!((*crb).crb_data_buffer[index]) as *mut u8,
+                    test_data[index],
+                );
             }
 
             let mut resp_data = [0u8; CRB_DATA_BUFFER_SIZE];
-            let status = sst.copy_response_data(0, &mut resp_data, CRB_DATA_BUFFER_SIZE as u32);
-            assert_eq!(status, ErrorCode::Ok);
+            let result = sst.copy_response_data(0, &mut resp_data);
+            assert_eq!(result, Ok(CRB_DATA_BUFFER_SIZE));
             for i in 0..CRB_DATA_BUFFER_SIZE {
                 assert_eq!(resp_data[i], test_data[i], "Byte Mismatch @ Index:{i}");
             }
@@ -1065,20 +1192,20 @@ mod tests {
         assert!(sst.is_crb_interface);
 
         unsafe {
-            let test_data: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
+            let test_data = [0x80, 0x01, 0, 0, 0, 14, 0, 0, 0, 0, 0xDE, 0xAD, 0xBE, 0xEF];
             let crb = sst.external_crb_ptr(1);
             #[allow(clippy::needless_range_loop)]
-            for i in 0..4 {
-                ptr::write_volatile(ptr::addr_of!((*crb).crb_data_buffer[i]) as *mut u8, test_data[i]);
+            for index in 0..test_data.len() {
+                ptr::write_volatile(
+                    ptr::addr_of!((*crb).crb_data_buffer[index]) as *mut u8,
+                    test_data[index],
+                );
             }
 
-            let mut resp_data = [0u8; 4];
-            let status = sst.copy_response_data(1, &mut resp_data, 4);
-            assert_eq!(status, ErrorCode::Ok);
-
-            for i in 0..4 {
-                assert_eq!(resp_data[i], test_data[i]);
-            }
+            let mut resp_data = [0u8; 14];
+            let result = sst.copy_response_data(1, &mut resp_data);
+            assert_eq!(result, Ok(test_data.len()));
+            assert_eq!(resp_data, test_data);
         }
     }
 

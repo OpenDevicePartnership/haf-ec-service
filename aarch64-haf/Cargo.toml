@@ -8,6 +8,8 @@ description = "AArch64 HAL for Hafnium"
 
 [dependencies]
 aarch64-cpu.workspace = true
-critical-section = { workspace = true, features = ["restore-state-u64"] }
 log.workspace = true
 hafnium.workspace = true
+
+[target.'cfg(target_os = "none")'.dependencies]
+critical-section = { workspace = true, features = ["restore-state-u64"] }
